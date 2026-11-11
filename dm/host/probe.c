@@ -398,6 +398,8 @@ void probe_atrace(uint64_t lo, uint64_t n) {
     int r = mprotect((void *)(uintptr_t)lo, n, PROT_NONE);
     LOG("DM_CTL: atrace range %d %#llx + %#llx armed%s", i, (unsigned long long)lo, (unsigned long long)n, r ? " (mprotect failed)" : "");
 }
+#else   // the iPhone has no fault hook for it; hle_hid.c's DM_CTL reader still names it, so the iOS app links
+void probe_atrace(uint64_t lo, uint64_t n) { (void)lo; (void)n; LOG("DM_CTL: atrace is Mac only"); }
 #endif
 void probe_install(void) {
 #if !TARGET_OS_IPHONE
