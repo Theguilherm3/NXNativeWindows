@@ -22,7 +22,7 @@ static id<MTLRenderPipelineState> tf_pso(NvShader *vs) {
     pso_key k; static const uint32_t cf[8]; pso_key_fill(&k, vs, nil, cf, 0, 0, 1, 0); k.fsfn = TF_MARK;
     id<MTLRenderPipelineState> cached = hm_get_id(&g_pso, &k);
     if (cached || hm_get_id(&g_pso_fail, &k)) return cached;
-    NSError *e = nil; id<MTLRenderPipelineState> ps = pso_build(pso_desc(&k, vs, nil, nil, 0), &e);
+    NSError *e = nil; id<MTLRenderPipelineState> ps = pso_build(pso_desc(&k, vs, nil, nil, 0), !k.border, &e);
     if (!ps) { MLOG("[RED] transform feedback pipeline %s: %s", vs->key, e.localizedDescription.UTF8String); hm_put_id(&g_pso_fail, &k, NSNull.null); }
     else hm_put_id(&g_pso, &k, ps);
     return ps;
@@ -39,7 +39,7 @@ static uint64_t tf_prepare(NvShader *vs, uint64_t source_count, uint64_t order, 
         j.stride[b]=vs->tf_stride[b];j.capacity[b]=(uint32_t)S.tf[b].size;
     }
     if (!g_tf_prepare) {
-        NSError *e=nil; id<MTLLibrary> lib=[g_dev newLibraryWithSource:@(k_nvn_tf_msl) options:nil error:&e];
+        NSError *e=nil; id<MTLLibrary> lib=host_lib("tf",&e);
         if (lib) g_tf_prepare=[g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"tf_prepare"] error:&e];
         if (!g_tf_prepare) { MLOG("[RED] transform feedback prepare: %s",e.localizedDescription.UTF8String); return 0; }
     }
@@ -65,9 +65,11 @@ static void tf_draw(NvProg *pr,const p_draw *dw,const p_draw_idx *di) {
     id<MTLRenderPipelineState> ps=vs&&vs->tf_fn?tf_pso(vs):nil;if(!ps)return;
     uint64_t dst[4]={0};uint64_t job=tf_prepare(vs,0,0,(uint32_t)count,dw->prim==0?1:dw->prim==1?2:3,
                                               dw->first,dw->count,dw->base_instance,dst);if(!job)return;
-    vbuf_prepare();if(g_blit){enc_b_end(g_blit);g_blit=nil;}
+    vbuf_prepare(vs?&vs->rf:NULL,dw,NULL);if(g_blit){enc_b_end(g_blit);g_blit=nil;}
     MTL4RenderPassDescriptor *rd=[MTL4RenderPassDescriptor new];rd.renderTargetWidth=rd.renderTargetHeight=rd.defaultRasterSampleCount=1;
-    id<MTL4RenderCommandEncoder> en=enc_r_begin(rd);enc_r_pso(en,ps);bind_vbufs(en);vconv_bind(en,vs,1,dw,NULL);
+    id<MTL4RenderCommandEncoder> en=enc_r_begin(rd);enc_r_pso(en,ps);
+    {int bad=bind_vbufs(en,&vs->rf);if(bad>=0){RED_ONCE(158,"vertex stream %d's buffer %#llx is in no memory pool; draw skipped",bad,(unsigned long long)S.vbuf[bad].address);enc_r_end(en);return;}}
+    vconv_bind(en,vs,1,dw,NULL);
     args_dirty_all();encode_args(en,vs,0,1);enc_r_vbuf(en,14,job);
     for(int b=0;b<4;b++)if(vs->tf_stride[b])enc_r_vbuf(en,TF_SLOT+b,dst[b]);
     enc_r_draw_instanced(en,MTLPrimitiveTypePoint,dw->first,dw->count,instances,dw->base_instance);enc_r_end(en);

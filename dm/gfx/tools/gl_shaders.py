@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import os, open
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mvgl
-from dmsh_chain import SPIRV_CROSS   # the in-repo spirv-cross build the NVN chain uses too (spirv_cross_bin)
+from dmsh_chain import SPIRV_CROSS, MAC_MIN_FLAG   # the in-repo spirv-cross build the NVN chain uses too (spirv_cross_bin)
 
 VEC_TYPES = {'float', 'vec2', 'vec3', 'vec4', 'int', 'ivec2', 'ivec3', 'ivec4', 'uint', 'uvec2', 'uvec3', 'uvec4', 'bool', 'mat2', 'mat3', 'mat4'}
 
@@ -101,8 +101,41 @@ def fixups(t):
 def glsl_type(t, refl):
     return refl['types'][t]['name'] if t in refl.get('types', {}) else t
 
+def uni_members(refl, ms, prefix, base, f, bools):
+    """Table rows for default block members. A struct's members recurse with their dotted name, which is the name the game passes to GL (u_LightEnv.m_dirLights_dir[0]); the
+    reflection gives a nested member's offset relative to its parent, so the parent's offset is added"""
+    for mb in ms:
+        arr = mb.get('array', [])
+        name = prefix + mb['name']
+        if len(arr) > 1: return f'uniform {name}: arrays of arrays'
+        if 'members' in refl['types'].get(mb['type'], {}):
+            if arr: return f'uniform {name}: an array of structs is not implemented'
+            e = uni_members(refl, refl['types'][mb['type']]['members'], name + '.', base + mb['offset'], f, bools)
+            if e: return e
+            continue
+        ty = glsl_type(mb['type'], refl)
+        if ty == 'uint' and mb['name'] in bools: ty = 'bool'
+        if ty not in VEC_TYPES: return f'uniform {name}: type {ty} (structs are not implemented)'
+        f.append(f'u:{name}={base + mb["offset"]}:{ty}:{arr[0] if arr else 0}:{mb.get("array_stride", 0)}')
+
+# GLSL ES 1.00, with its version statement (#version 100) or, as GameMaker's runner writes it, without one (Well Dweller's 93 run-time shaders): `attribute`, `varying`, `texture2D`, `gl_FragColor`, precision statements and
+# lowp / mediump / highp qualifiers. SPIR-V needs ES 3.10 or newer, so the text is rewritten before preprocessing (glslang rejects those keywords in 310). Metal has no use for the precision qualifiers;
+# the texture functions stay for fixups(), which renames them after preprocessing (a macro could hide one)
+def es100(t, stage):
+    t = re.sub(r'^[ \t]*precision[ \t]+\w+[ \t]+\w+[ \t]*;\r?[ \t]*\r?\n', '', t, flags=re.M)
+    t = re.sub(r'\b(?:lowp|mediump|highp)\b[ \t]*', '', t)
+    t = re.sub(r'\battribute\b', 'in', t)
+    t = re.sub(r'\bvarying\b', 'out' if stage == 'vert' else 'in', t)
+    if stage == 'frag' and 'gl_FragColor' in t:
+        t = 'out vec4 gm_FragColor;\n' + t.replace('gl_FragColor', 'gm_FragColor')
+    t = re.sub(r'\bsample\b', 'gm_sample', t)   # `sample` became a reserved word after ES 1.00 (GameMaker's sprite shaders use it as a variable)
+    return '#version 310 es\nprecision highp float;\nprecision highp int;\n' + t
+
 def translate(src, stage, key, tmp):
     """GLSL → MSL; returns (msl path, table fields) or an error string"""
+    t = src.decode('latin1')
+    v = re.search(r'^[ \t]*#version[ \t]+(\d+)[^\n]*\n?', t, re.M)
+    if not v or v.group(1) == '100': src = es100(t.replace(v.group(0), '', 1) if v else t, stage).encode('latin1')
     g = os.path.join(tmp, f'{key}.{stage}'); spv = g + '.spv'; msl = os.path.join(tmp, f'{key}_{stage[0]}.metal')
     open(g + '.in', 'wb').write(src)
     r = subprocess.run(['glslangValidator', '-E', '-S', stage, g + '.in'], capture_output=True, text=True)
@@ -132,13 +165,8 @@ def translate(src, stage, key, tmp):
         t = refl['types'][u['type']]
         if t['name'] != 'gl_DefaultUniformBlock': return f'uniform block {t["name"]} is not the default block'
         f.append(f'b:{u["binding"]}:{u["block_size"]}')
-        for mb in t['members']:
-            arr = mb.get('array', [])
-            if len(arr) > 1: return f'uniform {mb["name"]}: arrays of arrays'
-            ty = glsl_type(mb['type'], refl)
-            if ty == 'uint' and mb['name'] in bools: ty = 'bool'
-            if ty not in VEC_TYPES: return f'uniform {mb["name"]}: type {ty} (structs are not implemented)'
-            f.append(f'u:{mb["name"]}={mb["offset"]}:{ty}:{arr[0] if arr else 0}:{mb.get("array_stride", 0)}')
+        e = uni_members(refl, t['members'], '', 0, f, bools)
+        if e: return e
     for t in refl.get('textures', []):
         if t.get('array'): return f'sampler array {t["name"]}'
         f.append(f't:{t["name"]}={t["binding"]}:{t["type"]}')
@@ -162,7 +190,8 @@ def metallib(msls, out, sdk, extra):
     os.makedirs(out, exist_ok=True)
     def comp(m):
         a = m[:-6] + f'.{sdk}.air'
-        r = subprocess.run(['xcrun', '-sdk', sdk, 'metal', '-c', '-fpreserve-invariance', *extra, m, '-o', a], capture_output=True, text=True)
+        # -fwrapv: signed integer overflow wraps, as GLSL's (and SPIR-V's) integer arithmetic does; in MSL it is undefined and the compiler folds around it (dmsh_build.py MAC_METAL)
+        r = subprocess.run(['xcrun', '-sdk', sdk, 'metal', '-c', '-fpreserve-invariance', '-fwrapv', *extra, m, '-o', a], capture_output=True, text=True)
         if r.returncode: red(f'{m}: metal compile failed: {r.stderr.strip()[:400]}')
         return a
     with cf.ThreadPoolExecutor(os.cpu_count()) as ex: airs = list(ex.map(comp, msls))
@@ -194,7 +223,7 @@ def main():
                '# ' + ' '.join(subprocess.run(['glslangValidator', '--version'], capture_output=True, text=True).stdout.split()[:3]) + '; spirv-cross '
                + ' '.join((lambda r: r.stdout + r.stderr)(subprocess.run([SPIRV_CROSS, '--revision'], capture_output=True, text=True)).split())]
         tsv += [f'{k[0]}\t{v[0]}\t{" ".join(v[1])}\t{v[3]}' for k, v in sorted(seen.items())]
-        dirs = [(os.path.join(out, 'gl'), 'macosx', [])]
+        dirs = [(os.path.join(out, 'gl'), 'macosx', [MAC_MIN_FLAG])]   # the Mac host's minimum macOS, as the NVN chain's libraries (dmsh_chain.py MAC_MIN)
         if ios: dirs.append((os.path.join(ios, 'gl'), 'iphoneos', ['-mios-version-min=18.0', '-fmetal-math-mode=relaxed']))   # relaxed as in vk_shaders.py and ios_metal.py: no NaN / Inf assumption on the iPhone's GPU compiler
         msls = [v[2] for v in seen.values()]
         for d, sdk, extra in dirs:

@@ -139,7 +139,7 @@ static void add_pools(const uint8_t *d, size_t n) {   // the replay layer's pool
         cap_padd a; memcpy(&a, d + o, sizeof a);
         if (!dec_addr(NULL, &a.mem, 0, 0) || !a.mem) RFAIL("a pool lies in no captured region");
         static nvn_hmap seen = {.klen = 8}; if (nvn_hm_get(&seen, &a.mem)) continue; nvn_hm_put(&seen, &a.mem, (void *)1);
-        mtl_pool_add((void *)(uintptr_t)a.mem, a.size); nvn_dirty_add_range((void *)(uintptr_t)a.mem, a.size); rp_pools_added++;
+        mtl_pool_add((void *)(uintptr_t)a.mem, a.size); mtl_pool_addressed((void *)(uintptr_t)a.mem, a.size); nvn_dirty_add_range((void *)(uintptr_t)a.mem, a.size); rp_pools_added++;
     }
 }
 
@@ -218,9 +218,27 @@ int main(int argc, char **argv) { @autoreleasepool {
         return worst;
     }
     uint64_t tl0 = now_ns();
+    // The capture's textures and programs keep the live run's serials, and the replay layer's own objects (the per-stage combined programs of bind_stages) take theirs from
+    // the same counter and the same serial table: counted from 1 here, a combined program took a captured texture's serial, and that texture resolved to the program
+    // (Pokemon Scarlet: -[NvProg width] in rt_dims). Serials of a live run stay far below 2^61 (external textures take 2^62 and up)
+    nvn_serial_floor(1ull << 61);
     cap_reader rd; int lr = cap_load(&rd, path);
     if (lr <= 0) RFAIL("%s: %s", path, lr < 0 ? "not a capture of format 1" : "cannot read");
     for (;;) { cap_chunk c; uint8_t *d; int r = cap_next(&rd, &c, &d); if (r < 0) RFAIL("%s: corrupt chunk at byte %zu", path, rd.pos); if (!r) break;
+        if (c.tag == CAP_FAIL) RFAIL("%s: capture refused: %.*s", path, (int)MIN(c.raw, 1024), (const char *)d);
+        if (c.tag == CAP_SEGM) {
+            uint32_t idx, len; if (c.raw < 8) RFAIL("%s: short segment chunk", path);
+            memcpy(&idx, d, 4); memcpy(&len, d + 4, 4);
+            if ((uint64_t)len != c.raw - 8) RFAIL("%s: segment %u size mismatch", path, idx);
+            for (uint32_t off = 0; off < len;) {
+                op_hdr h; if (len - off < 8) RFAIL("%s: segment %u has a short record", path, idx);
+                memcpy(&h, d + 8 + off, 8);
+                if (h.size < 8 || (h.size & 7) || h.size > len - off) RFAIL("%s: segment %u has a corrupt record", path, idx);
+                const char *why = cap_record_unsupported(h.op);
+                if (why) RFAIL("%s: submit %u segment %u: %s", path, c.submit, idx, why);
+                off += h.size;
+            }
+        }
         rp_ch = realloc(rp_ch, (rp_nch + 1) * sizeof *rp_ch); rp_ch[rp_nch++] = (chunk){c, d}; }
     cap_unload(&rd);
     // header: game, layout, chain; then the live run's settings
@@ -233,7 +251,9 @@ int main(int argc, char **argv) { @autoreleasepool {
     head_get(head, hn, "frame", frame, sizeof frame); head_get(head, hn, "build", build, sizeof build);
     uint64_t mtl_frame = head_get(head, hn, "mtl_frame", v, sizeof v) ? strtoull(v, NULL, 10) : 0;
     if (strcmp(title, DM_GAME_ID)) RFAIL("the capture is of %s, this replayer is built for %s (make GAME=%s nvn_replay)", title, DM_GAME_ID, title);
-    if (ln != strlen(cap_layout()) || memcmp(lay, cap_layout(), ln)) RFAIL("the capture's record layout differs from this build's (nvn_obj.h changed since the capture): capture again");
+    if (!cap_layout_matches(lay, ln)) RFAIL("the capture's record layout differs from this build's (nvn_obj.h changed since the capture): capture again");
+    if (!head_get(head, hn, "iface", v, sizeof v) || atoi(v) != CAP_IFACE)   // the shader interface hashes check_programs compares (nvn_capture.inc cap_iface)
+        RFAIL("the capture's shader interface hashes are of another kind (%s, this build %d: before 2 they hashed nvn_refl.h's struct bytes): capture again", head_get(head, hn, "iface", v, sizeof v) ? v : "none", CAP_IFACE);
     printf("capture %s: %s frame %s, build %s, host %s, chain %s (this build: chain %s)\n", path, title, frame, build, commit, chain, DMSH_CHAIN);
     apply_env(head, hn);
     mtl_init();
@@ -274,7 +294,8 @@ int main(int argc, char **argv) { @autoreleasepool {
     }
     // pointers into the tables are fixed now (no more realloc): decode the texture objects, install the program keys and descriptor-pool bases in hle_nvn.c's side tables
     for (uint32_t i = 0; i < rp_nto; i++) cap_tex_fields(&rp_to[i], &rp_dec, NULL);
-    for (uint32_t i = 0; i < rp_npr; i++) { prog_keys_t *k = pk_get(&rp_pr[i], 1); memcpy(k->key, rp_prc[i].key, sizeof k->key); k->ok = rp_prc[i].ok; }
+    for (uint32_t i = 0; i < rp_npr; i++) if (rp_pr[i].serial) { prog_keys_t *k = pk_get(rp_pr[i].serial);   // keyed by serial, as SetShaders keys them
+        memcpy(k->key, rp_prc[i].key, sizeof k->key); k->ok = rp_prc[i].ok; }
     for (size_t i = 0; i < rp_nch; i++) if (rp_ch[i].c.tag == CAP_DPOL) for (size_t o = 0; o + sizeof(cap_dpol) <= rp_ch[i].c.raw; o += sizeof(cap_dpol)) { cap_dpol p; memcpy(&p, rp_ch[i].d + o, sizeof p);
         if (g_ntpb < NDPOOL) g_tpb[g_ntpb++] = (struct dpool_base){&rp_dp[p.index], p.tex_base}; if (g_nspb < NDPOOL) g_spb[g_nspb++] = (struct dpool_base){&rp_dp[p.index], p.samp_base}; }
     // how the replay layer held each texture: live ones are initialized (kept in the serial table, not the small ghost ring), CPU-written ones uploaded from their pools
@@ -317,7 +338,7 @@ int main(int argc, char **argv) { @autoreleasepool {
                 if (c->tag == CAP_PADD && s > 1) add_pools(d, c->raw);
                 else if (c->tag == CAP_PDIF) for (size_t o = 0; o + 24 <= c->raw;) { uint32_t r; uint64_t off, len; memcpy(&r, d + o, 4); memcpy(&off, d + o + 8, 8); memcpy(&len, d + o + 16, 8);
                     if (r >= rp_nrg || off + len > rp_rg[r].size || o + 24 + len > c->raw) RFAIL("a pool change outside its region"); memcpy(rp_rg[r].mem + off, d + o + 24, (size_t)len); o += 24 + (size_t)len; }
-                else if (c->tag == CAP_TREG) for (size_t o = 0; o + sizeof(cap_treg) <= c->raw; o += sizeof(cap_treg)) { cap_treg *e = (cap_treg *)(d + o); mtl_reg_tex(e->tid, e->ok ? &e->t : NULL, e->has_v ? &e->v : NULL); }
+                else if (c->tag == CAP_TREG) for (size_t o = 0; o + sizeof(cap_treg) <= c->raw; o += sizeof(cap_treg)) { cap_treg *e = (cap_treg *)(d + o); mtl_reg_tex(e->tid, e->ok ? &e->t : NULL, e->has_v ? &e->v : NULL); if (e->gone) mtl_reg_tex_gone(e->tid); }
                 else if (c->tag == CAP_SREG) for (size_t o = 0; o + sizeof(cap_sreg) <= c->raw; o += sizeof(cap_sreg)) { cap_sreg e; memcpy(&e, d + o, sizeof e); mtl_reg_samp(e.sid, &e.p); }
                 else if (c->tag == CAP_TPIX) fill_tex(d, c->raw);
             }

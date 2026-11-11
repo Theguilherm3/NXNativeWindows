@@ -129,6 +129,27 @@ if (os.name == 'nt' or os.environ.get('NXW_LINUX')) and not os.environ.get('NXW_
             return spec
         importlib.util.spec_from_file_location = _spec_from_file_location
 
+    # The translator that runs here is dmsh_xlate.dll (through dotnet, _map above), not the committed native Mach-O that dm/gfx/tools/tool_lock.py fingerprints: its tools_now()
+    # gives the DLL's fingerprint as the lock's dmsh_xlate line, so a rebuilt DLL changes the lock and the chain version as a rebuilt native translator does upstream
+    import importlib.abc, importlib.machinery
+    class _ToolLockFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path=None, target=None):
+            if name != 'tool_lock': return None
+            spec = importlib.machinery.PathFinder.find_spec(name, path)
+            if not spec or not spec.loader: return spec
+            load = spec.loader.exec_module
+            def exec_module(m):
+                load(m)
+                now = m.tools_now
+                def tools_now():
+                    t = now(); dll = os.path.join(m.XLATE_DIR, 'dmsh_xlate.dll')
+                    if os.path.isfile(dll): t['dmsh_xlate'] = m.sha16(dll)
+                    return t
+                m.tools_now = tools_now
+            spec.loader.exec_module = exec_module
+            return spec
+    sys.meta_path.insert(0, _ToolLockFinder())
+
     # The Mac shader libraries (xcrun -sdk macosx metal / metallib … -o <file>): the iOS build never packs them, and what it reads from the Mac outputs (c1_guard.py, cb_extent.py)
     # is the MSL and the JSON beside them. An empty file is written in place of each, with no process at all (starting one costs about 0.35 s here, as much as the compile),
     # which halves the shader stage. NXW_MAC_METAL=1 compiles them for real

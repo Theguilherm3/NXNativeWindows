@@ -53,9 +53,12 @@ Validation on the M4 Pro:
 - [Frame-step state with a front patch area](../../../docs/reference/rewriter.md#frame-step-state-with-a-front-patch-area).
 - [PKZ version 1 archives](../../../docs/reference/shaders.md#pkz-version-1-archives).
 - [Newest GPU code version reported by the driver](../../../docs/reference/nvn-objects.md#newest-gpu-code-version-reported-by-the-driver): precompiled shader versions do not follow the linked SDK.
+- [The alpha test through a library of its own](../../../docs/reference/rendering.md#the-alpha-test-through-a-library-of-its-own): the death effect's tendrils (`EffectOpacityBlood`, alpha written by the shader, no `discard`) stayed solid black; reported on PR #32 with an implementation of its own (358 of one frame's 3,048 draws alpha-tested, function 5, GREATER).
+- [A resolution family member reads another size's compressed blocks as garbage](../../../docs/reference/rendering.md#a-resolution-family-member-reads-another-sizes-compressed-blocks-as-garbage): a strobing pink / white glow after the pause menu (issue #1935); the 1600x900 HDR targets share their storage with the menu's 1440x810 ones.
 
 ## Open
 
+- Check the death effect's tendrils with the host's alpha test (reported fixed on PR #32 with another implementation).
 - Validate the unsigned IPA on an iPhone, including memory pressure and touch controls.
 - Trace the tutorial's cube placeholder and validate visible effects against the original game.
 - Validate later combat input windows, camera behavior and cinematic audio/video sync with the 60 fps profile; establish sustained performance without competing workloads.

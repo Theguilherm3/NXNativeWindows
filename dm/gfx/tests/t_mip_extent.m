@@ -37,7 +37,7 @@ static void target(recording *r,const tex_t *t,int lv,int slot,const tex_t *othe
 }
 static void finish(recording *r) {
     NVNcommandHandle h=h_nvnCommandBufferEndRecording(&r->cb);state_reset();memset(&R,0,sizeof R);
-    mtl_sub_begin();mtl_exec((const uint8_t *)h);
+    mtl_sub_begin();mtl_exec(nvn_rec_linear(h, NULL));
     int done=mtl_wait(mtl_sub_commit(),5000000000ull);EXPECT("production GPU done",1,done);if(!done)abort();EXPECT("no error in commit feedback",0,mtl_last_commit_error());
     mtl_pool_del(r->mem);free(r->mem);
 }
@@ -113,7 +113,7 @@ int main(int argc,char **argv){@autoreleasepool{
     for(int i=0;i<2;i++){NvProg *p=[NvProg new];p->sh[0]=[NvShader new];p->sh[0]->fn=[lib newFunctionWithName:@"v"];
         if(!i){p->sh[1]=[NvShader new];p->sh[1]->fn=[lib newFunctionWithName:@"f"];p->sh[1]->stage=1;}
         (i?&depth_pg:&colour_pg)->serial=80000+i;serial_put(80000+i,p);}
-    if(stencil_only){plane_case("stencil_only",1,0);EXPECT("existing stencil-only mode",3,g_enc_mode);EXPECT("stencil-only attaches no depth",1,g_pass.hs&&!g_pass.hd);}
+    if(stencil_only){plane_case("stencil_only",1,0);EXPECT("existing stencil-only mode",3,g_enc_mode);EXPECT("stencil-only usage disables depth",1,g_pass.hs&&!g_pass.hd);}
     else if(argc>1&&!strcmp(argv[1],"--default"))colour_case("default",1,0,0,0,0);
     else if(argc>1&&!strcmp(argv[1],"--oversized"))colour_case("oversized",1,2,0,0,0);
     else {for(int lv=0;lv<4;lv++){char name[64];snprintf(name,sizeof name,"bounded_L%d",lv);colour_case(name,lv,1,0,0,0);

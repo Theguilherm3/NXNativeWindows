@@ -11,6 +11,11 @@ static int hid_usleep(useconds_t usec);
 #undef clock_gettime
 #undef usleep
 #include "../pad_slots.h"
+void dm_oe_execute(int index, const void *param, size_t n) { (void)index; (void)param; (void)n; }   // DM_CTL "program", "webshot": not exercised here
+void front_web_shot(const char *path) { (void)path; }
+// The controller applet's prompt (front.h): -1 is no window; a test sets the answer and the players that join while it is up
+static int g_prompt_answer = -1, g_prompt_calls, g_prompt_min, g_prompt_max; static uint32_t g_prompt_join;
+int front_ctrl_support(int min, int max) { g_prompt_calls++; g_prompt_min = min; g_prompt_max = max; if (g_prompt_join) dm_pad_players(g_prompt_join); return g_prompt_answer; }
 
 static int checks, fails, g_mode = 1, g_signals;
 static void *g_signalled;
@@ -23,26 +28,41 @@ static int hid_usleep(useconds_t usec) { (void)usec; if (script_hold) script_hol
 int dm_opmode(void) { return g_mode; }
 uint64_t guest_ns(void) { return 1000000000ull; }
 uint64_t now_ns(void) { return motion_now; }
-uint64_t dm_guest_frame(void) { return 0; }
-void dm_touch_set(const dm_touch *t, int n) { (void)t; (void)n; }
-int touch_fill_n(void *out, int max, uint64_t now) { (void)out; (void)max; (void)now; return 0; }
+static uint64_t test_frame;   // presented frames (t_rec moves it)
+uint64_t dm_guest_frame(void) { return test_frame; }
+// The touchscreen as the game would read it: the first finger, and whether one was put down since the last read (a touch's Start is reported once, hle_touch.c)
+static int touch_down, touch_new, touch_downs; static float touch_x, touch_y;
+static void touch_to(const dm_touch *t, int n) { if (n > 0) { touch_new |= !touch_down; touch_downs += !touch_down; touch_x = t[0].x; touch_y = t[0].y; } touch_down = n > 0; }
+void (*_Atomic dm_touch_observer)(const dm_touch *t, int n);
+void dm_touch_set(const dm_touch *t, int n) { touch_to(t, n); void (*o)(const dm_touch *, int) = atomic_load(&dm_touch_observer); if (o) o(t, n); }
+void dm_touch_script(const dm_touch *t, int n) { touch_to(t, n); }
+static int64_t touch_samp; static int touch_points = -1;   // hle_touch.c numbers every read from 1; the last read's points argument
+int touch_fill_n(void *out, int max, uint64_t now, int points) { (void)max; (void)now; touch_points = points; memset(out, 0, 0x10); int64_t s = ++touch_samp; memcpy(out, &s, 8); return 0; }
 int gesture_fill(void *out, int n, uint64_t now) { (void)out; (void)n; (void)now; return 0; }
 void dm_gfx_shot_at(long frame, const char *path) { (void)frame; (void)path; }
 void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }
 void hle_signal_system_event(void *g) { g_signalled = g; g_signals++; }
 int hle_signal_bound_system_event(void *g) { g_signalled = g; g_signals++; return 1; }
 void dm_gfx_texlist(int target) { (void)target; }
+// the guest address space (hle_svc.c): the unit test has none, so every stack is a host stack and the big-stack take-overs (the controller applet) run on it directly (hle_bigstack.c)
+int dm_guest_as_contains(uintptr_t a) { (void)a; return 0; }
+void dm_gfx_restop(void) {}
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
 void dm_ctl_peek(uint64_t a, int n) { (void)a; (void)n; }
+void crash_dump_now(const char *why) { (void)why; }
 void dm_ctl_memdump(uint64_t a, uint64_t n, const char *path) { (void)a; (void)n; (void)path; }
 void dm_ctl_cvar_i32(uint64_t off, int32_t v) { (void)off; (void)v; }
 void dm_ctl_cvar_f32(uint64_t off, float v) { (void)off; (void)v; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_passdump_next(long n) { (void)n; }
+static int applet_depth, applet_opens, applet_closes_at_depth0;   // hle_oe.c: the applet stand-ins open and close their applet around the answer
+void dm_applet_enter(const char *name) { (void)name; applet_depth++; applet_opens++; }
+void dm_applet_leave(void) { applet_closes_at_depth0 += --applet_depth == 0; }
 
 static uint64_t buttons_of(uint32_t id, uint32_t style) { NpadState s; fill(&s, id, style); return s.attributes ? s.buttons & 0xffff : 0; }
 static int32_t lx_of(uint32_t id) { NpadState s; fill(&s, id, STYLE_FULLKEY); return s.lx; }
 static void ids(const uint32_t *v, uint64_t n) { h_hid_SetIds(v, n); }
+static NpadState npad_of(uint32_t id, uint32_t style) { NpadState s; fill(&s, id, style); return s; }   // all of it, the rail buttons (bits 24..27) included
 
 static void t_slots(void) {
     pad_slots s; memset(&s, 0, sizeof s);
@@ -87,11 +107,73 @@ static void t_npads(void) {
     CHECK(buttons_of(0, STYLE_FULLKEY) == DM_BTN_Y && lx_of(0) == 0, "player 1 does not see player 2");
     CHECK(buttons_of(1, STYLE_HANDHELD) == 0, "player 2 is not a handheld controller");
     CHECK(h_hid_Led(&(uint32_t){0}) == 0x1 && h_hid_Led(&(uint32_t){1}) == 0x3 && h_hid_Led(&(uint32_t){7}) == 0x6, "player LED patterns");
+    {   // Home button protection: what the game set, per npad, off by default (Nintendo Switch Sports Resort asks at boot)
+        uint32_t no1 = 0, no8 = 7, other = 0x10, handheld = 0x20, bad = 9;
+        CHECK(!h_hid_HomeProtectOn(&no1) && !h_hid_HomeProtectOn(&handheld), "Home protection starts off");
+        h_hid_HomeProtect(&no1, true); h_hid_HomeProtect(&handheld, true);
+        CHECK(h_hid_HomeProtectOn(&no1) && h_hid_HomeProtectOn(&handheld) && !h_hid_HomeProtectOn(&no8) && !h_hid_HomeProtectOn(&other), "on for the npads the game turned it on for");
+        h_hid_HomeProtect(&no1, false);
+        CHECK(!h_hid_HomeProtectOn(&no1) && h_hid_HomeProtectOn(&handheld), "off again for No1, Handheld kept");
+        h_hid_HomeProtect(&bad, true); CHECK(!h_hid_HomeProtectOn(&bad) && !h_hid_HomeProtectOn(NULL), "an id that is no npad: off");
+        h_hid_HomeProtect(&handheld, false);
+    }
     int32_t info[2]; int8_t arg[8] = {1, 4};
     CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && info[0] == 2 && info[1] == 0, "the controller applet reports two players, player 1 selected");
+    CHECK(applet_opens == 1 && applet_depth == 0 && applet_closes_at_depth0 == 1, "the controller applet opens and closes once around its answer (focus 2, then 1)");
     arg[1] = 1; h_hid_ShowCtrl(info, arg);
     CHECK(info[0] == 1, "the applet's count is capped at the game's maximum");
+    arg[0] = 3; arg[1] = 4;
+    CHECK(h_hid_ShowCtrl(info, arg) == RES_CTRL_CANCELED && info[0] == 2, "fewer players than the game's minimum: canceled (2202-3101), as the player closing the applet");
+    CHECK(h_hid_ShowCtrl0(arg) == RES_CTRL_CANCELED, "the overload without a result: canceled too");
+    arg[0] = 2; CHECK(h_hid_ShowCtrl0(arg) == RES_OK, "the overload without a result: OK when the minimum is met");
+    CHECK(g_prompt_calls == 2 && g_prompt_min == 3 && g_prompt_max == 4, "below the minimum the front end's prompt is asked, with the game's minimum and maximum");
+    {   // GitHub issue #1640: with a window the prompt waits for players to join
+        int calls = g_prompt_calls; arg[0] = 3; arg[1] = 4;
+        g_prompt_answer = 1; g_prompt_join = 0x7;
+        CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && info[0] == 3, "a third player joins while the prompt is up: OK with three");
+        g_prompt_join = 0x3; dm_pad_players(0x3);
+        CHECK(h_hid_ShowCtrl(info, arg) == RES_CTRL_CANCELED && info[0] == 2, "the prompt done with fewer than the minimum: canceled all the same");
+        g_prompt_answer = 0; g_prompt_join = 0x7;
+        CHECK(h_hid_ShowCtrl(info, arg) == RES_CTRL_CANCELED && info[0] == 3, "the player closes the prompt (B): canceled, whoever joined");
+        dm_pad_players(0x3); g_prompt_answer = 1; g_prompt_join = 0;
+        setenv("DM_CTL", "/nonexistent", 1);
+        CHECK(h_hid_ShowCtrl(info, arg) == RES_CTRL_CANCELED && g_prompt_calls == calls + 3, "scripted input (DM_CTL): no prompt, canceled at once");
+        unsetenv("DM_CTL");
+        arg[0] = 2; CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && g_prompt_calls == calls + 3, "the minimum met: no prompt");
+        g_prompt_answer = -1;
+    }
+    CHECK(h_hid_Strap() == RES_OK && h_hid_StrapArg(arg) == RES_OK, "both strap guide overloads answer as the player closing the guide");
+    CHECK(applet_opens == 12 && applet_depth == 0, "every answer opened and closed its applet");
+    arg[0] = 1;
     CHECK(six_connected(0x0100 | 0) && !six_connected(0x0200 | 0), "player 2 has a six-axis sensor, No3 none");
+    {   // GitHub issue #2237: more players than the game's maximum. The applet leaves the players past it out, so the game does not see them and open it again
+        arg[0] = 1; arg[1] = 1; g_signals = 0;
+        CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && info[0] == 1 && dm_players_reported() == 1, "two players, one wanted: the applet answers one and one is reported");
+        CHECK(h_hid_GetStyle(&(uint32_t){1}) == 0 && buttons_of(1, STYLE_FULLKEY) == 0, "No2 reads as not connected");
+        CHECK(g_signals == 1 && g_signalled == ev1, "No2's style event tells the game");
+        CHECK(buttons_of(0, STYLE_FULLKEY) == (DM_BTN_Y | DM_BTN_B) && lx_of(0) == 300, "a maximum of one: the controller left out feeds player 1");
+        g_signals = 0;
+        CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && info[0] == 1 && g_signals == 0, "asked again: the same answer, nothing changes");
+        h_hid_ShowCtrl(info, NULL); CHECK(info[0] == 1, "the applet without arguments reports the players the game sees");
+        dm_pad_players(0x1); dm_pad_players(0x3); dm_pad_set_player(1, DM_BTN_B, 300, 0, 0, 0);
+        CHECK(h_hid_GetStyle(&(uint32_t){1}) == STYLE_FULLKEY, "a controller that went away and came back is a player again, until the applet says otherwise");
+        CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && h_hid_GetStyle(&(uint32_t){1}) == 0, "and the applet leaves it out again");
+        dm_pad_players(0x7); dm_pad_set_player(2, DM_BTN_X, 0, 0, 0, 0);
+        CHECK(h_hid_GetStyle(&(uint32_t){2}) == STYLE_FULLKEY, "a third controller connects: a player of its own, on No3");
+        arg[1] = 2;
+        CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && info[0] == 2, "one to two players wanted, three connected: two");
+        CHECK(h_hid_GetStyle(&(uint32_t){1}) == STYLE_FULLKEY && h_hid_GetStyle(&(uint32_t){2}) == 0, "the lowest players stay: player 2 is back, player 3 is left out");
+        CHECK(buttons_of(0, STYLE_FULLKEY) == DM_BTN_Y && buttons_of(1, STYLE_FULLKEY) == DM_BTN_B, "a maximum above one: the controller left out feeds nobody");
+        arg[1] = 4;
+        CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && info[0] == 3 && buttons_of(2, STYLE_FULLKEY) == DM_BTN_X, "the applet opened for up to four: all three play");
+        arg[1] = 1; h_hid_ShowCtrl(info, arg);
+        CHECK(h_hid_GetStyle(&(uint32_t){1}) == 0 && h_hid_GetStyle(&(uint32_t){2}) == 0, "one wanted: players 2 and 3 left out");
+        CHECK(buttons_of(0, STYLE_FULLKEY) == (DM_BTN_Y | DM_BTN_B | DM_BTN_X), "and both feed player 1");
+        ids((const uint32_t[]){0, 1, 2, NPAD_HANDHELD}, 4);
+        CHECK(h_hid_GetStyle(&(uint32_t){1}) == STYLE_FULLKEY && h_hid_GetStyle(&(uint32_t){2}) == STYLE_FULLKEY, "the game sets its supported npads again: everyone counts again");
+        ids((const uint32_t[]){0, 1, 2, 3, 4, 5, 6, 7, NPAD_HANDHELD}, 9);
+        dm_pad_players(0x3); arg[1] = 4;
+    }
 
     // A one-player game ({No1, Handheld}): player 2's controller plays as player 1, No2 reads as not connected
     g_signals = 0; ids((const uint32_t[]){0, NPAD_HANDHELD}, 2);
@@ -122,6 +204,123 @@ static void t_npads(void) {
     CHECK(info[0] == 2 && info[1] == NPAD_HANDHELD, "handheld: the applet selects the handheld controller");
 }
 
+
+// The console mode at run time (dm_set_opmode → dm_hid_opmode_changed): player 1 moves between No1 and Handheld and both npads' style events are signalled, Handheld's too
+// (GitHub issue #2143); a pair of Joy-Cons split over two npads gives up the second one in handheld mode, and that npad's event is signalled as well
+static void t_opmode(void) {
+    static uint8_t e0[0x40], e1[0x40], eh[0x40];
+    g_mode = 1; ids((uint32_t[]){0, 1, NPAD_HANDHELD}, 3); dm_pad_players(1); h_hid_SetStyles(0xffffffffu);
+    g_signals = 0; h_hid_BindStyleEv(&(uint32_t){0}, e0, 0);
+    CHECK(g_signals == 1 && g_signalled == e0, "binding No1 docked: signalled once for its controller");
+    h_hid_BindStyleEv(&(uint32_t){NPAD_HANDHELD}, eh, 0); h_hid_BindStyleEv(&(uint32_t){1}, e1, 0);
+    CHECK(g_signals == 1, "binding Handheld and No2 docked: no controller, no signal");
+    dm_hid_opmode_changed(); CHECK(g_signals == 1, "no mode change, no style change: no signal");
+    g_signals = 0; g_signalled = NULL; g_mode = 0; dm_hid_opmode_changed();
+    CHECK(g_signals == 2 && g_signalled == eh, "to handheld: No1 and Handheld signalled");
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == 0 && h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == STYLE_HANDHELD, "player 1 is on Handheld");
+    g_signals = 0; g_mode = 1; dm_hid_opmode_changed();
+    CHECK(g_signals == 2 && h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY && h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == 0, "back to console: both signalled again, player 1 on No1");
+    // A split pair: left on No1, right on No2 while docked; handheld takes both back
+    dm_joy_attach(0, 3); h_hid_JoySingle(&(uint32_t){0});
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_JOYLEFT && h_hid_GetStyle(&(uint32_t){1}) == STYLE_JOYRIGHT, "a split pair docked: JoyLeft on No1, JoyRight on No2");
+    g_signals = 0; g_mode = 0; dm_hid_opmode_changed();
+    CHECK(g_signals == 3 && h_hid_GetStyle(&(uint32_t){1}) == 0, "to handheld with a split pair: No1, No2 and Handheld signalled, No2 empty");
+    g_signals = 0; g_mode = 1; dm_hid_opmode_changed();
+    CHECK(g_signals == 3 && h_hid_GetStyle(&(uint32_t){1}) == STYLE_JOYRIGHT, "back to console: the three again, the right Joy-Con on No2");
+    h_hid_JoyDual(&(uint32_t){0}); dm_joy_attach(0, 0);
+    // An npad bound while its controller is there is told that style by the bind: the next report signals nothing for it
+    static uint8_t e0b[0x40]; h_hid_BindStyleEv(&(uint32_t){0}, e0b, 0);
+    g_signals = 0; dm_pad_players(1); dm_hid_opmode_changed(); CHECK(g_signals == 0, "nothing changed since the bind: no signal");
+}
+
+// Joy-Cons as devices of their own (dm_joy_attach / dm_joy_set): nothing changes until a front end reports a Joy-Con half; then the pair is a JoyDual npad, splits into JoyLeft and
+// JoyRight when the game asks for single assignment (or the controller applet needs another player), keeps the rail buttons, and has vibration handles per Joy-Con. Handheld: unchanged.
+static void t_joycons(void) {
+    g_mode = 1; ids((uint32_t[]){0, 1, 2, 3}, 4); dm_pad_players(1);
+    h_hid_SetStyles(STYLE_FULLKEY | STYLE_JOYDUAL | STYLE_JOYLEFT | STYLE_JOYRIGHT);
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY, "no Joy-Con reported: player 1 is full-key, as before");
+    { int m; CHECK(vib_targets(0x0003, &m) && m == 0, "and its full-key vibration handle reaches it"); }
+    dm_haptics_route(0, 1);
+    static uint8_t ev0[0x40]; h_hid_BindStyleEv(&(uint32_t){0}, ev0, 0);
+    g_signals = 0; dm_joy_attach(0, 3);
+    CHECK(g_signals == 1 && g_signalled == ev0 && h_hid_GetStyle(&(uint32_t){0}) == STYLE_JOYDUAL, "a left and a right Joy-Con on player 1: one JoyDual npad, No1's style event signalled and no other");
+    g_signals = 0; dm_joy_attach(0, 3); CHECK(g_signals == 0, "the same Joy-Cons reported again: no signal");
+    dm_joy_set(0, 0, DM_BTN_UP | DM_BTN_LSL, -20000, 0); dm_joy_set(0, 1, DM_BTN_A | DM_BTN_RSR, 0, 15000);
+    NpadState st = npad_of(0, STYLE_JOYDUAL);
+    CHECK((st.buttons & (DM_BTN_UP | DM_BTN_A | DM_BTN_LSL | DM_BTN_RSR)) == (DM_BTN_UP | DM_BTN_A | DM_BTN_LSL | DM_BTN_RSR), "JoyDual: both Joy-Cons' buttons, the rail buttons kept");
+    CHECK(st.lx == -20000 && st.ry == 15000 && (st.attributes & (ATTR_LEFT_CONN | ATTR_RIGHT_CONN)) == (ATTR_LEFT_CONN | ATTR_RIGHT_CONN), "JoyDual: each Joy-Con's stick on its side, both halves connected");
+    uint32_t h[2], id = 0;
+    CHECK(h_hid_VibHandles(h, 2, &id, STYLE_JOYDUAL) == 2 && (h[0] & 0xff) == 5 && h[1] == (h[0] | 1u << 16), "JoyDual vibration handles: type 5, a motor per Joy-Con");
+    { int m; CHECK(vib_targets(h[1], &m) == 1 && m == 1, "the right Joy-Con's JoyDual handle reaches motor 1"); }
+    { int m; CHECK(vib_targets(0x10003, &m) == 1 && m == 1 && vib_targets(0x0003, &m) == 1 && m == 0, "the full-key handles the game got before the pair connected still reach both Joy-Cons"); }
+
+    // The game supports no Joy-Con style: the pad's merged state as full-key, as before
+    h_hid_SetStyles(STYLE_FULLKEY);
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY, "no Joy-Con style supported: full-key");
+    h_hid_SetStyles(STYLE_FULLKEY | STYLE_JOYDUAL | STYLE_JOYLEFT | STYLE_JOYRIGHT);
+
+    // Single assignment: the left Joy-Con stays on No1, the right one takes No2 (no player of its own there)
+    h_hid_JoySingle(&(uint32_t){0});
+    CHECK(h_hid_GetJoyAssign(&(uint32_t){0}) == 1 && h_hid_GetStyle(&(uint32_t){0}) == STYLE_JOYLEFT && h_hid_GetStyle(&(uint32_t){1}) == STYLE_JOYRIGHT, "single: JoyLeft on No1, JoyRight on No2");
+    st = npad_of(1, STYLE_JOYRIGHT);
+    CHECK((st.buttons & (DM_BTN_A | DM_BTN_RSR)) == (DM_BTN_A | DM_BTN_RSR) && !(st.buttons & DM_BTN_UP) && st.ry == 15000 && st.attributes == (ATTR_CONNECTED | ATTR_RIGHT_CONN), "the right half on No2: its own buttons and stick only");
+    id = 1; CHECK(h_hid_VibHandles(h, 2, &id, STYLE_JOYRIGHT) == 1 && (h[0] & 0xff) == 7, "JoyRight: one vibration handle, type 7");
+    { int m; CHECK(vib_targets(h[0], &m) == 1 && m == 1, "it reaches player 1's right motor, on No2"); }
+    uint32_t other = 9; CHECK(h_hid_JoySingleOut(&other, &(uint32_t){0}, 0) == 1 && other == 1, "single assignment with the other half: No2");
+    h_hid_JoyDual(&(uint32_t){0});
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_JOYDUAL && h_hid_GetStyle(&(uint32_t){1}) == 0, "dual again: one JoyDual npad, No2 empty");
+
+    // The controller applet asks for two players with one pair connected: it splits the pair, as holding the Joy-Cons sideways does on a Switch
+    int32_t info[2]; int8_t arg[8] = {2, 4};
+    { int calls = g_prompt_calls;
+    CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && info[0] == 2 && h_hid_GetStyle(&(uint32_t){1}) == STYLE_JOYRIGHT, "the applet splits the pair for a second player");
+    CHECK(g_prompt_calls == calls && dm_players_reported() == 2, "the split pair is enough: no controller prompt, and the prompt's count (dm_players_reported) sees two players"); }
+    h_hid_JoyDual(&(uint32_t){0});
+
+    // Handheld mode: player 1's Joy-Cons count as attached to the console (the Handheld npad), and are never split
+    g_mode = 0; ids((uint32_t[]){0, 1, NPAD_HANDHELD}, 3);
+    CHECK(h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == STYLE_HANDHELD && h_hid_GetStyle(&(uint32_t){0}) == 0, "handheld: player 1's Joy-Cons are the Handheld npad");
+    g_mode = 1; ids((uint32_t[]){0, 1, 2, 3}, 4);
+
+    // One Joy-Con alone on player 2: JoyRight on No2; leaving: full-key again
+    dm_pad_players(3); dm_joy_attach(1, 2);
+    CHECK(h_hid_GetStyle(&(uint32_t){1}) == STYLE_JOYRIGHT, "one right Joy-Con alone: JoyRight on its own npad");
+    dm_joy_attach(1, 0); dm_joy_attach(0, 0);
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY && h_hid_GetStyle(&(uint32_t){1}) == STYLE_FULLKEY, "no Joy-Con reported any more: full-key controllers, as before");
+    dm_haptics_route(0, 0); dm_pad_players(1); h_hid_SetStyles(0xffffffffu);
+}
+
+// A Joy-Con's mouse sensor (dm_joy_mouse): its JcmsState ring by handle (npad id, JcmsType 0 left / 1 right), newest first; none for a Joy-Con that never reported
+static void t_jcms(void) {
+    g_mode = 1; ids((uint32_t[]){0, 1}, 2); dm_pad_players(1); dm_joy_attach(0, 3);
+    JcmsState st[4]; uint32_t hl = h_hid_JcmsHandle(&(uint32_t){0}, &(uint32_t){0}), hr = h_hid_JcmsHandle(&(uint32_t){0}, &(uint32_t){1});
+    CHECK(hl == 0x000 && hr == 0x100 && h_hid_JcmsStates(st, 4, &hr) == 0, "no mouse samples before a front end reports them");
+    CHECK(!dm_joy_mouse_wanted(), "the sensors stay off until the game sets them up");
+    h_hid_JcmsInit(NULL, 0); CHECK(dm_joy_mouse_wanted(), "InitializeJcms asks for the sensors");
+    h_hid_NmouseInit(NULL, 0, 1920, 1080); h_hid_JcmsFini(); CHECK(dm_joy_mouse_wanted(), "the pointer still wants them after FinalizeJcms");
+    h_hid_NmouseFini(); CHECK(!dm_joy_mouse_wanted(), "off again once both are finalized");
+    dm_joy_mouse(0, 1, 5, -3, DM_JOYMOUSE_CONNECTED | DM_JOYMOUSE_ON_SURFACE); dm_joy_mouse(0, 1, 7, 2, DM_JOYMOUSE_CONNECTED | DM_JOYMOUSE_ON_SURFACE);
+    CHECK(h_hid_JcmsStates(st, 4, &hr) == 2 && st[0].sampling == 2 && st[0].dx == 7 && st[1].dy == -3 && st[0].attributes == 3, "the right Joy-Con's samples, newest first");
+    CHECK(h_hid_JcmsStates(st, 4, &hl) == 0, "the left Joy-Con has reported none");
+    memset(st, 0xff, sizeof st); h_hid_JcmsState(st, &hr);
+    CHECK(st[0].sampling == 2 && st[0].dx == 7 && st[0].unk0 == 0, "GetJcmsState: the newest");
+    for (int i = 0; i < 40; i++) dm_joy_mouse(0, 1, i, 0, 1);
+    CHECK(h_hid_JcmsStates(st, 4, &hr) == 4 && st[0].dx == 39 && st[3].dx == 36, "a full ring keeps the newest");
+    uint32_t bad = 0x200; CHECK(h_hid_JcmsStates(st, 4, &bad) == 0, "a JcmsType past 1 has no states");
+    // The pointer: a handle per Joy-Con whose sensor reports, the one last used on a surface first, kept first while lifted
+    uint64_t nh[4]; CHECK(h_hid_NmouseHandles(nh, 4, 0) == 1 && (nh[0] & 0xffff) == 0x0001, "one pointer handle: the right Joy-Con, the only one that reported");
+    dm_joy_mouse(0, 0, 1, 1, DM_JOYMOUSE_CONNECTED | DM_JOYMOUSE_ON_SURFACE);
+    CHECK(h_hid_NmouseHandles(nh, 4, 0) == 2 && (nh[0] & 1) == 0 && (nh[1] & 1) == 1, "the left Joy-Con, last on a surface, comes first");
+    dm_joy_mouse(0, 0, 0, 0, DM_JOYMOUSE_CONNECTED);
+    CHECK(h_hid_NmouseHandles(nh, 4, 0) == 2 && (nh[0] & 1) == 0, "it stays first while lifted");
+    NmouseState ns; CHECK(h_hid_NmouseState(&ns, nh[0]) && (ns.attributes & 2) && !(ns.attributes & 1) && !h_hid_NmouseState(&ns, 0), "its state: connected, off the surface; the merged handle has none");
+    // The Joy-Con 2 styles: a Joy-Con 2 pair shows JoyDual's Joy-Con 2 form to a game that supports only that
+    h_hid_SetStyles(STYLE_JOYDUAL2); dm_joy_attach(0, 3 | DM_JOY_2);
+    CHECK((h_hid_GetStyle(&(uint32_t){0}) & (STYLE_JOYDUAL | STYLE_JOYDUAL2)) == (STYLE_JOYDUAL | STYLE_JOYDUAL2), "a Joy-Con 2 pair: JoyDual with its Joy-Con 2 bit");
+    dm_joy_attach(0, 3); CHECK(!(h_hid_GetStyle(&(uint32_t){0}) & STYLE_JOYDUAL2), "a plain pair: no Joy-Con 2 bit");
+    h_hid_SetStyles(0xffffffffu); dm_joy_attach(0, 0);
+}
+
 static dm_haptic_state vibration[DM_PLAYERS];
 static int vibration_calls;
 static void vibration_sink(dm_haptic_state s) { vibration[s.player] = s; vibration_calls++; }
@@ -133,6 +332,7 @@ static void t_vibration(void) {
     dm_haptics_init(vibration_sink, 1);
     CHECK(!h_hid_VibPermit() && h_hid_VibHandles(h, 2, &id, STYLE_FULLKEY) == 2,
           "startup handles do not wait for a routed haptics output");
+    CHECK(!h_hid_VibMounted(&h[0]), "no routed output: device not mounted");
     h_hid_SendVib(&h[0], &v);
     CHECK(dm_haptics_actual(0, 0).amplitude_low == 0, "a value before routing is not retained");
     dm_haptics_route(0, 1); dm_haptics_route(1, 1);
@@ -146,7 +346,12 @@ static void t_vibration(void) {
     h_hid_SendVib(&h[0], &v); h_hid_VibActual(&got, &h[0]);
     CHECK(!memcmp(&got, &v, sizeof v) && vibration[1].motor[0].amplitude_low == 0, "game value is retained for the addressed player only");
     h_hid_VibInfo(info, &h[1]); CHECK(info[0] == 1 && info[1] == 2, "right motor is a right LRA");
+    CHECK(h_hid_VibMounted(&h[0]) && h_hid_VibMounted(&h[1]), "both motors of a routed controller are mounted");
+    CHECK(h_hid_VibMountedOunce(&h[0]) && h_hid_VibMountedOunce(&h[1]) && !h_hid_VibMountedOunce(NULL), "the Switch 2's form answers the same");
     uint32_t invalid[] = {0, 0x20003, 0x1000003, 0x203};
+    int mounted = 0;
+    for (unsigned i = 0; i < sizeof invalid / sizeof *invalid; i++) mounted |= h_hid_VibMounted(&invalid[i]);
+    CHECK(!mounted && !h_hid_VibMounted(NULL), "invalid style, motor, reserved byte, disconnected player and no handle are not mounted");
     vibration_calls = 0;
     for (unsigned i = 0; i < sizeof invalid / sizeof *invalid; i++) h_hid_SendVib(&invalid[i], &v);
     CHECK(!vibration_calls, "invalid style, motor, reserved byte and disconnected player are ignored");
@@ -162,11 +367,14 @@ static void t_vibration(void) {
     CHECK(h_hid_VibHandles(h, 2, &id, STYLE_FULLKEY) == 2, "merged controller supplies rumble when player 1 has no physical output");
     g_mode = 0; id = NPAD_HANDHELD;
     CHECK(h_hid_VibHandles(h, 2, &id, STYLE_HANDHELD) == 2 && h[0] == 0x2004 && h[1] == 0x12004, "handheld SDK vibration handles");
-    CHECK(!vib_targets(3), "old docked handle is not valid in handheld mode");
+    { int m; CHECK(!vib_targets(3, &m), "old docked handle is not valid in handheld mode"); }
+    CHECK(!h_hid_VibMounted(&(uint32_t){3}) && h_hid_VibMounted(&h[0]), "mounted follows the connected controller's style");
     dm_haptics_route(1, 0);
     CHECK(!h_hid_VibPermit(), "disconnecting the last output disables vibration");
     dm_haptics_init(vibration_sink, 0); dm_haptics_route(0, 1);
-    CHECK(!h_hid_VibPermit() && !h_hid_VibHandles(h, 2, &id, STYLE_HANDHELD), "rumble disabled: no vibration devices");
+    CHECK(!h_hid_VibPermit() && h_hid_VibHandles(h, 2, &id, STYLE_HANDHELD) == 2, "rumble disabled: not permitted, but the handles exist, as on a Switch");
+    dm_haptics_set_enabled(1);
+    CHECK(h_hid_VibPermit(), "rumble turned on while the game runs: the handles it took work");
 }
 
 static void *vibration_sender(void *arg) {
@@ -226,6 +434,7 @@ static void t_script(void) {
     g_mode = 1; dm_pad_players(1);
     dm_pad_set(0, 0, 0, 0, 0); buttons_of(0, STYLE_FULLKEY);
     dm_input_set(DM_BTN_X, 0, 0, 0, 0);
+    static key_step one[1]; g_steps = one; g_cap_steps = 0;
     g_nsteps = 1; g_steps[0] = (key_step){.btn = DM_BTN_A | DM_BTN_SHAKE, .lx = -0x7000, .hold = 0.15};
     script_hold = t_script_hold; keys_main(NULL); script_hold = NULL;
     CHECK(buttons_of(0, STYLE_FULLKEY) == (DM_BTN_B | DM_BTN_X), "script release preserves the controller and keyboard buttons");
@@ -242,7 +451,112 @@ static void t_script(void) {
     CHECK(s.buttons == DM_BTN_A && s.lx == 100 && s.ly == -200 && s.rx == 300 && s.ry == -400, "scripted buttons and all four axes reach player 1 in handheld mode");
     script_set(0, 0, 0, 0, 0); buttons_of(NPAD_HANDHELD, STYLE_HANDHELD);
     g_mode = 1; dm_pad_players(1);
-    g_nsteps = 0;
+    g_nsteps = 0; g_steps = NULL;
+}
+
+// DM_REC (GitHub issue #313): player 1's physical input written as DM_KEYS steps, read back by the DM_KEYS parser and played on the scripted path at the game's reads (keys_sync);
+// the game's view of every frame (buttons with their press latch, the shake, sticks, the touchscreen) is the same in the recording and the replay, to the recorder's stick and touch
+// steps, also for input that arrived after a frame's read
+typedef struct { uint64_t btn; int32_t q[4]; int touch; int32_t tx, ty; } frame_view;
+enum { REC_FRAMES = 64, REC_END = 62 };
+static frame_view rec_live[REC_FRAMES], rec_replay[REC_FRAMES];
+static frame_view game_reads(void) {   // what the game reads in this frame (and consumes: the press latches, a new touch)
+    NpadState s; fill(&s, 0, STYLE_FULLKEY);
+    frame_view v = {(s.buttons & 0xffff) | ((atomic_load(&g_btn) | atomic_load(&g_sc_btn) | atomic_load(&g_pad_btn[0])) & DM_BTN_SHAKE)};
+    int32_t a[4] = {s.lx, s.ly, s.rx, s.ry}; for (int i = 0; i < 4; i++) v.q[i] = (int32_t)lrint(a[i] * 100.0 / DM_STICK_MAX);
+    if ((v.touch = touch_down || touch_new)) { v.tx = (int32_t)lrintf(touch_x * 1000); v.ty = (int32_t)lrintf(touch_y * 1000); }
+    touch_new = 0;
+    return v;
+}
+static void live_to(uint64_t f) { while (test_frame < f) { rec_live[test_frame] = game_reads(); test_frame++; } }   // the game reads, then the next frame is presented
+static void replay_frame(void) { if (test_frame < REC_FRAMES) rec_replay[test_frame] = game_reads(); test_frame++; }   // keys_main waits: a frame goes by
+static void replay_late(void) { replay_frame(); replay_frame(); }   // keys_main waits and wakes late: two frames go by
+static void t_rec(void) {
+    g_mode = 1; dm_pad_players(1);
+    dm_input_set(0, 0, 0, 0, 0); dm_pad_set(0, 0, 0, 0, 0); script_set(0, 0, 0, 0, 0); game_reads();
+    char path[512]; snprintf(path, sizeof path, "%s/t_hid_rec.keys", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    test_frame = 0;
+    CHECK(rec_open(path), "DM_REC opens its file");
+    live_to(10); dm_input_set(DM_BTN_A, 0, 0, 0, 0);                         // the keyboard's A
+    live_to(12); dm_pad_set(0, 16384, -8192, 0, 0);                          // the controller's left stick half right, a quarter down
+    live_to(13); dm_pad_set(0, 16400, -8200, 0, 0);                          // drift within a step: no new step
+    live_to(15); dm_input_set(0, 0, 0, 0, 0);
+    live_to(20); dm_pad_set(0, 0, 0, 0, 0);
+    live_to(22); dm_input_set(DM_BTN_B, 0, 0, 0, 0); dm_input_set(0, 0, 0, 0, 0);   // B tapped between two reads: the latch hands it to frame 22's read, recorded there
+                 dm_pad_set(0, 0, 0, DM_STICK_MAX, 0); dm_pad_set(0, 0, 0, 0, 0);    // a stick flicked between two reads: the game cannot see it, not recorded
+    live_to(30); dm_touch_set(&(dm_touch){0, .25f, .75f}, 1);                 // the mouse on the touchscreen, dragged, lifted
+    live_to(31); dm_touch_set(&(dm_touch){0, .3f, .75f}, 1);
+    live_to(32); dm_touch_set(&(dm_touch){0, .302f, .75f}, 1);               // moved within a step
+    live_to(33); dm_touch_set(NULL, 0);
+    live_to(40); dm_input_set(DM_BTN_ZR | DM_BTN_SHAKE, 0, 0, 0, 0);
+    live_to(41); script_set(DM_BTN_X, 0, 0, 0, 0); dm_touch_script(&(dm_touch){0, .5f, .5f}, 1);   // scripted input (DM_KEYS, DM_CTL) is never recorded
+                 game_reads(); script_set(0, 0, 0, 0, 0); dm_touch_script(NULL, 0);
+    live_to(45); dm_input_set(0, 0, 0, 0, 0);
+    live_to(50); rec_live[50] = game_reads(); dm_input_set(DM_BTN_X, 0, 0, 0, 0); test_frame = 51;   // X arrives after frame 50's read: the game sees it from frame 51, stamped there
+    live_to(55); dm_input_set(0, 0, 0, 0, 0);
+    live_to(60); dm_input_set(DM_BTN_Y, 0, 0, 0, 0);                         // still held at exit: ends at the exit's frame
+    live_to(REC_END); dm_rec_finish();
+    atomic_store(&g_rec_on, 0); atomic_store(&dm_touch_observer, NULL); fclose(g_rec_file); g_rec_file = NULL;
+    dm_input_set(0, 0, 0, 0, 0); game_reads();
+
+    char text[1024] = {0}; FILE *f = fopen(path, "r"); size_t n = f ? fread(text, 1, sizeof text - 1, f) : 0; if (f) fclose(f); text[n] = 0; unlink(path);
+    const char *want = "f10:A~f2,\nf12:A+L0.50/-0.25~f3,\nf15:L0.50/-0.25~f5,\nf22:B~f1,\nf30:T0.250x0.750~f1,\nf31:T0.300x0.750~f2,\nf40:ZR+Shake~f5,\nf51:X~f4,\nf60:Y~f2,\n";
+    CHECK(!strcmp(text, want), "DM_REC writes the expected DM_KEYS steps");
+    if (strcmp(text, want)) fprintf(stderr, "recorded:\n%s", text);
+
+    keys_parse(text);
+    CHECK(g_nsteps == 9, "the DM_KEYS parser reads every recorded step");
+    if (g_nsteps == 9) {
+        CHECK(g_steps[1].frame && g_steps[1].at == 12 && g_steps[1].fhold && g_steps[1].hold == 3 && g_steps[1].btn == DM_BTN_A && g_steps[1].lx == 16384 && g_steps[1].ly == -8192,
+              "a recorded step reads back as its frame, frame hold, buttons and stick");
+        CHECK(g_steps[4].tap && g_steps[4].tx == .25f && g_steps[4].ty == .75f && g_steps[6].btn == (DM_BTN_ZR | DM_BTN_SHAKE), "touches and the shake read back");
+    }
+    CHECK(keys_framed(), "a recording is all frame steps held in frames: it is played at the game's reads");
+    touch_downs = 0; g_sync_next = g_sync_held = 0; atomic_store(&g_sync_on, 1);
+    for (test_frame = 0; test_frame <= REC_END; test_frame++) rec_replay[test_frame] = game_reads();
+    CHECK(touch_downs == 1, "a recorded drag replays as one finger that moves, not as taps");
+    CHECK(rec_replay[REC_END - 1].btn == DM_BTN_Y && !rec_replay[REC_END].btn && !atomic_load(&g_sync_on), "the replay ends at the frame the recording ended");
+    int bad = -1;
+    for (int i = 0; i < REC_END && bad < 0; i++) {
+        const frame_view *a = &rec_live[i], *b = &rec_replay[i]; int same = a->btn == b->btn && a->touch == b->touch;
+        for (int k = 0; k < 4; k++) same &= abs(a->q[k] - b->q[k]) < REC_STICK_STEP;
+        if (a->touch) same &= abs(a->tx - b->tx) < REC_TOUCH_STEP && abs(a->ty - b->ty) < REC_TOUCH_STEP;
+        if (!same) bad = i;
+    }
+    CHECK(bad < 0, "the replay gives the game the recorded input in every frame");
+    if (bad >= 0) fprintf(stderr, "frame %d: recorded %#llx L%d/%d touch %d, replayed %#llx L%d/%d touch %d\n", bad, (unsigned long long)rec_live[bad].btn, rec_live[bad].q[0], rec_live[bad].q[1],
+                          rec_live[bad].touch, (unsigned long long)rec_replay[bad].btn, rec_replay[bad].q[0], rec_replay[bad].q[1], rec_replay[bad].touch);
+    CHECK(rec_live[22].btn == DM_BTN_B && rec_replay[22].btn == DM_BTN_B && !rec_replay[23].btn, "a tap between two reads reaches the game once, live and replayed");
+    CHECK(!rec_live[50].btn && !rec_replay[50].btn && rec_replay[51].btn == DM_BTN_X, "input that came after a frame's read reaches the replay's next frame, as it did live");
+    CHECK(!atomic_load(&g_sc_btn) && !touch_down, "the replay releases everything at its end");
+    free(g_steps); g_steps = NULL; g_nsteps = g_cap_steps = 0;
+    // With the step limit raised for long recordings the steps are ordered by a merge sort: repeated groups still interleave, and steps at one time keep their listed order
+    keys_parse("290:A*3/3,291:Left*3/3 291.5:B*3/3\n300:X,300:Y");
+    static const uint64_t order[11] = {DM_BTN_A, DM_BTN_LEFT, DM_BTN_B, DM_BTN_A, DM_BTN_LEFT, DM_BTN_B, DM_BTN_A, DM_BTN_LEFT, DM_BTN_B, DM_BTN_X, DM_BTN_Y};
+    int ordered = g_nsteps == 11; for (int i = 0; ordered && i < 11; i++) ordered = g_steps[i].btn == order[i];
+    CHECK(ordered, "repeats interleave in time order and equal times keep their listed order; spaces and newlines separate steps");
+    free(g_steps); g_steps = NULL; g_nsteps = g_cap_steps = 0;
+    // A recording of the earlier format (stamped when input arrived: a press within one frame as ~f0) still plays at the reads: the press latch hands it to its frame's read
+    keys_parse("f5:B~f0,\nf6:A~f1,\n");
+    g_sync_next = g_sync_held = 0; atomic_store(&g_sync_on, 1); memset(rec_replay, 0, sizeof rec_replay);
+    for (test_frame = 0; test_frame < 9; test_frame++) rec_replay[test_frame] = game_reads();
+    CHECK(rec_replay[5].btn == DM_BTN_B && rec_replay[6].btn == DM_BTN_A && !rec_replay[4].btn && !rec_replay[7].btn, "a hold of 0 frames reaches its frame's read once");
+    free(g_steps); g_steps = NULL; g_nsteps = g_cap_steps = 0;
+    // A list with a step in seconds is played by keys_main. A replay that runs late: two frames go by each time keys_main waits, so the first tap is pressed a frame late and the second is already due when the first is let go. A gap
+    // in the list is a release the game must read, so the second tap is a press of its own (it used to follow without a release, and the game saw one long press)
+    keys_parse("f11:A~f2,\nf14:A~f2,\n");
+    memset(rec_replay, 0, sizeof rec_replay); test_frame = 0; script_hold = replay_late; keys_main(NULL); script_hold = NULL; replay_frame();   // the game reads the last frame
+    int presses = 0; for (int i = 1; i < REC_FRAMES; i++) presses += (rec_replay[i].btn & DM_BTN_A) && !(rec_replay[i - 1].btn & DM_BTN_A);
+    CHECK(presses == 2, "a late replay keeps the release between two taps: the game reads two presses");
+    free(g_steps); g_steps = NULL; g_nsteps = g_cap_steps = 0;
+    // DM_KEYS=@<file>: a recording too long for the environment is read from its file as it is
+    FILE *kf = fopen(path, "w"); CHECK(kf != NULL, "the steps file is written");
+    if (kf) { for (int i = 0; i < 50000; i++) fprintf(kf, "f%d:A+L0.50/-0.25~f1,\n", 2 * i); fclose(kf); }
+    char *kt = keys_file(path); CHECK(kt && strlen(kt) > 1000000, "keys_file reads a recording of more than 1 MiB whole");
+    if (kt) keys_parse(kt); free(kt); unlink(path);
+    CHECK(g_nsteps == 50000 && g_steps[49999].at == 99998, "all 50,000 steps of the file are parsed");
+    free(g_steps); g_steps = NULL; g_nsteps = g_cap_steps = 0;
+    CHECK(!keys_file(path), "a missing steps file reads as none");
 }
 
 // Live controller motion (dm_motion_set): player 1's six-axis sensor reports the controller's tilt and rotation instead of lying flat, and goes back to flat when cleared
@@ -354,6 +668,24 @@ static void t_motion_hid(void) {
     dm_motion_clear_hid(0); dm_motion_clear_hid(1); dm_motion_clear(0); g_phone_motion.last_ns = 0;
     dm_pad_players(1); g_phone_mode = -1;
 }
+// Touch screen reads across docked <-> handheld: every read goes to hle_touch.c, which numbers the states of both modes from one count (t_touch checks the numbers), with
+// touch points asked for only in handheld mode. Numbered apart (docked from the npad counter, 65536; handheld from 1), a game started docked dropped every touch after
+// leaving the dock: Unity's touch reader (Aokana main+0xd2bde0) takes a state only if its sampling number is above the last one it took, empty states included.
+static void t_touch_sampling(void) {
+    uint8_t s[0x10 + 0x28 * 16]; int64_t prev = 0, v;
+    const int modes[] = {1, 1, 0, 0, 1, 0};
+    for (int i = 0; i < 6; i++) {
+        g_mode = modes[i]; memset(s, 0, sizeof s);
+        if (i & 1) CHECK(h_hid_TouchN_16(s, 1) == 1, "touch: GetTouchScreenStates gives one state");
+        else h_hid_Touch1_16(s);
+        memcpy(&v, s, 8);
+        CHECK(touch_points == !modes[i], "touch: touch points are asked for in handheld mode only");
+        CHECK(v > prev, i == 2 ? "touch: handheld after docked continues the sampling numbers" : i == 4 ? "touch: docked after handheld continues the sampling numbers"
+                                : i == 5 ? "touch: handheld again continues the sampling numbers" : "touch: sampling numbers increase");
+        prev = v;
+    }
+    g_mode = 1;
+}
 
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
@@ -361,10 +693,39 @@ int main(void) {
     t_npads();
     t_script();
     t_vibration();
+    t_opmode();
+    t_joycons();
+    t_jcms();
     t_rumble_log();
     t_motion_threads();
     t_motion_live();
     t_motion_hid();
+    t_touch_sampling();
+    t_rec();
+    {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing
+        int w = 0, h = 0; uint64_t std = 7; uint32_t npad = 9;
+        h_hid_NmouseInitT(NULL, 0, 1920, 1080, 1); h_hid_NmouseGetRange(&w, &h);
+        CHECK(w == 1920 && h == 1080, "InitializeNmouse with a pointer type keeps the range");
+        h_hid_NmouseSetRange(1280, 720); h_hid_NmouseGetRange(&w, &h);
+        CHECK(w == 1280 && h == 720, "SetNmousePointerRanges is what GetNmousePointerRanges reads");
+        CHECK(!h_hid_NmouseStd(&std) && std == 7, "no standard mouse handle");
+        uint64_t merged = 1; CHECK(h_hid_NmouseMerged(&merged) && merged == 0, "the merged handle is 0");
+        CHECK(h_hid_NmouseEnable(merged, 0x101) && h_hid_NmousePos(merged, 10, 10), "the merged handle takes the pointer settings (a bool argument's high bits ignored)");
+        CHECK(!h_hid_NmouseEnable(5, 1) && !h_hid_NmousePos(5, 0, 0), "an unknown handle does not");
+        CHECK(!h_hid_NmouseState(NULL, merged) && !h_hid_NmouseNpad(&npad, merged) && npad == 9, "no state and no controller behind the merged handle");
+    }
+    {   // DM_PAD_PRESS_TO_JOIN=1: the lowest free slot at the first press, not the slot a controller of that name held before
+        pad_slots q = {0}; static char x, y, z;   // distinct addresses
+        CHECK(pad_slot_take_lowest(&q, &x, "Pro Controller") == 0, "press: the first to press is player 1");
+        CHECK(pad_slot_take_lowest(&q, &y, "Pro Controller") == 1, "press: the next is player 2, even of the same model");
+        CHECK(pad_slot_take_lowest(&q, &x, "Pro Controller") == 0, "press: pressing again keeps the slot");
+        pad_slot_free(&q, &x);
+        CHECK(pad_slot_take_lowest(&q, &z, "Xbox Wireless Controller") == 0, "press: a freed player 1 goes to whoever presses next, whatever its name");
+        pad_slots f = {0}; static char o[DM_PLAYERS + 1];
+        for (int i = 0; i < DM_PLAYERS; i++) pad_slot_take_lowest(&f, &o[i], "pad");
+        CHECK(pad_slot_take_lowest(&f, &o[DM_PLAYERS], "pad") == -1, "press: none left when every player is held");
+        CHECK(pad_slot_take_lowest(&f, NULL, "pad") == -1, "press: no owner, no slot");
+    }
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

@@ -60,8 +60,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         {
             foreach ((int id, MemoryDefinition memory) in memories)
             {
-                SpvInstruction pointerType = context.TypePointer(storage, context.GetType(memory.Type, memory.ArrayLength));
-                SpvInstruction variable = context.Variable(pointerType, storage);
+                SpvInstruction type = context.GetType(memory.Type, memory.ArrayLength);
+                SpvInstruction pointerType = context.TypePointer(storage, type);
+                SpvInstruction variable = context.Variable(pointerType, storage, memory.ZeroInit ? context.ConstantNull(type) : null);
 
                 context.AddGlobalVariable(variable);
 
@@ -225,11 +226,20 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static void DeclareImages(CodeGenContext context, IEnumerable<TextureDefinition> images)
         {
+            bool extendedFormats = false;
+
             foreach (TextureDefinition image in images)
             {
                 int setIndex = context.TargetApi == TargetApi.Vulkan ? image.Set : 0;
 
                 Dim dim = GetDim(image.Type);
+
+                // nxnative: the rg32ui image of a 64-bit image atomic (Instructions.GenerateImageAtomic) is an extended storage format in SPIR-V (PR #1801)
+                if (context.HostCapabilities.MetalImageAtomics && image.Format == TextureFormat.R32G32Uint && !extendedFormats)
+                {
+                    extendedFormats = true;
+                    context.AddCapability(Capability.StorageImageExtendedFormats);
+                }
 
                 SpvInstruction imageType = context.TypeImage(
                     context.GetType(image.Format.GetComponentType()),
