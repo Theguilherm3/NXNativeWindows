@@ -13,7 +13,8 @@ work = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(tempfile.gettempdir()) /
 sdk = tc.ios_sdk() or ba.die('no iPhoneOS SDK'); clang = tc.llvm_tool('clang') or ba.die('no clang')
 (work / 'profile').mkdir(parents=True, exist_ok=True)
 ba.py(ba.DM / 'games/game.py', 'header', game, work / 'profile/game_profile.h')
-files, incs = ba.host_sources(work / 'profile')
+files, incs = ba.host_sources(work / 'profile', ba.host_msl(work))
 files += [p.resolve() for p in sorted((ba.IOS / 'Sources').glob('*.m'))] + [(WIN / 'ios/Launcher.m').resolve(), (WIN / 'ios/DataHelp.m').resolve(), (WIN / 'ios/nxw_unzip.c').resolve()]
+incs += [(ba.IOS / 'Sources').resolve()]   # win/ios/Launcher.m includes the iOS headers it shares with GameMenu.swift's and Launcher.swift's callers (CloudSaves.h, DmGameMenu.h)
 objs = ba.compile_all(clang, sdk, files, incs, work / 'obj', [])
 print(f'compile_check: {len(objs)} files compiled for {game} ({sdk.name} {" ".join(tc.sdk_settings(sdk))})')
