@@ -56,11 +56,13 @@ def main():
     BuildError = up.BuildError
 
     extra = [str(p) for p in (tc.llvm_bin(),) if p] + [str(tc.tool_on_path(t).parent) for t in ('spirv-cross', 'zstd', 'glslangValidator') if tc.tool_on_path(t)]
-    up.TOOL_PATHS = extra + ([str(Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'dotnet')] if tc.WINDOWS else up.TOOL_PATHS)   # upstream's list has ~/.dotnet
+    up.TOOL_PATHS = extra + ([str(Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'dotnet')] if tc.WINDOWS else up.TOOL_PATHS + [str(Path.home() / '.dotnet')])   # dotnet-install.sh's folder (upstream's list no longer has it: its tools are native)
     # the shader chain takes spirv-cross from SPIRV_CROSS, else the repository's Mach-O build (dm/gfx/tools/dmsh_chain.py): here the native one the toolchain names
     sc = tc.tool_on_path('spirv-cross')
     if sc: os.environ.setdefault('SPIRV_CROSS', str(sc))
     if not tc.WINDOWS: os.environ['PATH'] = os.pathsep.join(up.TOOL_PATHS + [os.environ.get('PATH', '')])   # this process's own lookups too (the shim's dotnet, the doctor's checks)
+    dn = shutil.which('dotnet')
+    if dn and not tc.WINDOWS: os.environ.setdefault('DOTNET_ROOT', str(Path(dn).resolve().parent))   # a .NET in ~/.dotnet: the apphost nx_extract finds its runtime through it
 
     def check_prereqs(env, xlate, mac=False):
         if mac: raise BuildError('the Mac platforms need a Mac')
@@ -69,15 +71,26 @@ def main():
         if not xlate.parent.is_dir(): raise BuildError(f'the shader translator is missing from the repository: {xlate}')
     up.check_prereqs = check_prereqs
 
-    def build_nx_extract(repo, work, logs, env):
-        import tempfile, shutil
-        nx = work / 'tools/nx_extract/nx_extract'
-        with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:
-            up.run(['dotnet', 'build', repo / 'dm/tools/nx_extract', '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
-            if not (Path(t) / 'nx_extract.exe').exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
-            up.rmtree(nx.parent); shutil.copytree(t, nx.parent)
-        return nx   # Windows starts nx_extract.exe for this path
-    if tc.WINDOWS: up.build_nx_extract = build_nx_extract   # on Linux dotnet writes nx_extract, as upstream expects
+    # nx_extract: upstream commits it as a native Mach-O (dm/tools/nx_extract_bin, built by native_tools.sh), which runs on neither Windows nor Linux. The same in-repo source is built
+    # here with dotnet, once per source digest, into win/build/nx_extract-<digest>/, and checked as upstream checks its own (--source-sha against nx_extract_source_sha)
+    _nx = {}
+    def find_nx_extract(repo, env):
+        want = up.nx_extract_source_sha(repo)
+        if want in _nx: return _nx[want]
+        import tempfile
+        out = WIN / 'build' / f'nx_extract-{want}'
+        exe = out / ('nx_extract.exe' if tc.WINDOWS else 'nx_extract')
+        if not exe.exists():
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='nx_extract_', dir=out.parent) as t:
+                r = subprocess.run(['dotnet', 'build', str(repo / 'dm/tools/nx_extract'), '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo', '-p:PublishAot=false'], capture_output=True, text=True, env=env)
+                if r.returncode or not (Path(t) / exe.name).exists(): raise BuildError('nx_extract did not build with dotnet: ' + ((r.stdout or '') + (r.stderr or '')).strip()[-1500:])
+                up.rmtree(out); shutil.copytree(t, out)
+        r = subprocess.run([str(exe), '--source-sha'], capture_output=True, text=True, env=env)
+        if r.returncode or r.stdout.strip() != want: raise BuildError(f'nx_extract at {exe} does not run or was not built from the in-repo source (embedded {r.stdout.strip() or "none"} / in repo {want}): delete that folder and build again')
+        _nx[want] = exe
+        return exe
+    up.find_nx_extract = find_nx_extract
 
     # address-region cuts for an sdk build sdk_patches.py does not register (win/sdk_auto_cuts.py), for a game with virtual address memory: written beside the rewrite, read by the
     # shim when patch_nso.py imports sdk_patches, and part of the rewrite's cache key (patch_files)

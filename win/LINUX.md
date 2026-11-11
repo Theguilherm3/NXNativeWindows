@@ -120,8 +120,8 @@ Every required line should say `ok`. The two Metal compiler lines run `metal.exe
 ```sh
 export NXW_LINUX=1 PYTHONPATH="$PWD/win/pyshim" SPIRV_CROSS="$TOOLS/bin/spirv-cross" PATH="$HOME/.dotnet:$PATH"
 PY=~/.local/venvs/nxnative/bin/python
-$PY dm/gfx/tools/dmsh_chain.py --check-tools
-$PY dm/gfx/tools/dmsh_chain.py --update-lock && $PY dm/gfx/tools/dmsh_chain.py --header
+$PY dm/gfx/tools/tool_lock.py --check-tools
+$PY dm/gfx/tools/tool_lock.py --update-lock && $PY dm/gfx/tools/dmsh_chain.py --header
 ```
 
 `--check-tools` prints `[RED]` lines and exits 1 when a tool differs. The environment variables load the port's shim, so `xcrun` reaches the Windows Metal compiler and the translator runs through `dotnet`. The chain version in `dm/gfx/nvn/dmsh_chain.h` follows the lock, and the app and its shader libraries are both built from it. Keep the two files' Linux versions local rather than committing them, since the repository's lock is the Windows one.

@@ -355,7 +355,7 @@ The list itself is upstream's ([`dm/games/settings.tsv`](dm/games/settings.tsv))
 |---|---|---|
 | Extract NSP / XCI (LibHac) | `nx_extract` (.NET) | the same, built with the .NET SDK for Windows |
 | Rewrite the game modules | `patch_nso.py` | the same |
-| Translate shaders (Ryujinx) | `dmsh_xlate` apphost | the same locked DLLs through `dotnet dmsh_xlate.dll`, so the chain's fingerprints still match `dmsh_chain.lock` |
+| Translate shaders (Ryujinx) | `dmsh_xlate` (a native Mach-O) | `dotnet dmsh_xlate.dll`, built from the same in-repo source; `dmsh_chain.lock` fingerprints the DLL |
 | Compile shader libraries | `xcrun metal` / `metallib` (Xcode) | Metal Developer Tools for Windows, through [`win/xcrun.py`](win/xcrun.py) (`-mios-version-min` becomes `-target air64-apple-ios…`) |
 | Build the app | `xcodegen` + `xcodebuild` | LLVM `clang -target arm64-apple-ios26.0 -isysroot iPhoneOS.sdk`, linked by `ld64.lld` ([`win/build_app.py`](win/build_app.py)) |
 | Launcher | `Launcher.swift` (SwiftUI) | [`win/ios/Launcher.m`](win/ios/Launcher.m) (UIKit, same contract) |

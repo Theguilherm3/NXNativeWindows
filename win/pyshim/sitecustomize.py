@@ -169,3 +169,18 @@ if (os.name == 'nt' or os.environ.get('NXW_LINUX')) and not os.environ.get('NXW_
         if os.environ.get('NXW_SHIM_TRACE'): print('nxw shim:', args, '->', _map(args), file=sys.stderr)
         _init(self, _map(args), *a, **k)
     subprocess.Popen.__init__ = _popen_init
+
+    # tool_lock.py run as a script (--check-tools / --update-lock) is __main__, which the finder above never sees: its command line is run here instead, on the module imported
+    # through the finder, and the process ends with its exit status (os._exit: a SystemExit raised while site imports this file would stop Python with a fatal error)
+    if sys.argv and os.path.basename(sys.argv[0]) == 'tool_lock.py' and os.path.isfile(sys.argv[0]):
+        _tl_path = os.path.abspath(sys.argv[0])
+        sys.path.insert(0, os.path.dirname(_tl_path))
+        import tool_lock as _tl
+        _src = _open(_tl_path, encoding='utf-8').read()
+        _cli = _src[_src.index("if __name__ == '__main__':"):].replace("if __name__ == '__main__':", 'if True:', 1)
+        _code = 0
+        try: exec(compile(_cli, _tl_path, 'exec'), vars(_tl))
+        except SystemExit as e:
+            if isinstance(e.code, int) or e.code is None: _code = e.code or 0
+            else: print(e.code, file=sys.stderr); _code = 1
+        sys.stdout.flush(); sys.stderr.flush(); os._exit(_code)

@@ -23,7 +23,7 @@ Verified on Windows 11 with LLVM 23.1.4, Metal Developer Tools for Windows 6.2 (
 | `actool` asset catalog | loose PNG icons named in `CFBundleIcons`, scaled by Pillow | `win/build_app.py` |
 | `sips`, `plutil` | Pillow, `plistlib` | `win/build_app.py` |
 | `make -n -B dmhost` (source list) | the `dm/host/Makefile` source rules, reproduced. The build stops if the Makefile's `SRC=` / `GFX=` lines change. | `build_app.host_sources()` |
-| `dmsh_xlate` apphost (Mach-O) | `dotnet dmsh_xlate.dll`: the same locked DLLs, so the chain fingerprints still match `dmsh_chain.lock` | `win/pyshim/sitecustomize.py` |
+| `dmsh_xlate` (upstream's native Mach-O) | `dotnet dmsh_xlate.dll`, built from the same in-repo source (AnyCPU); the shim makes `tool_lock.py` fingerprint the DLL, so `dmsh_chain.lock` names what runs | `win/pyshim/sitecustomize.py` |
 | `which`, `python3`, `ctypes.CDLL(None)` (clonefile) | `shutil.which`, the current Python, an empty library (falls back to plain copies) | `win/pyshim/sitecustomize.py` |
 | Unix modes in the IPA (the executable's x bit) | `pack_ipa.py --exec`: on Windows, folders are packed as 755, the executable as 755, other files as 644 | `dm/ios/tools/pack_ipa.py` |
 | iPhoneOS SDK from Xcode | `win/sdk/extract_xip.py` streams `Xcode_26.xip` (xar, then pbzx, then cpio) and writes only `iPhoneOS.sdk` | `win/sdk/extract_xip.py` |
