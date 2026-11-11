@@ -86,7 +86,8 @@ if (os.name == 'nt' or os.environ.get('NXW_LINUX')) and not os.environ.get('NXW_
         if key not in _XC: _XC[key] = t.metal_tool(sdk, tool)
         exe = _XC[key]
         if not exe: return None
-        return t.cmd(exe) + (x.metal_args(sdk, rest[3:]) if tool == 'metal' else rest[3:])
+        args = x.metal_args(sdk, rest[3:]) if tool == 'metal' else rest[3:]
+        return t.cmd(exe) + (x.no_spaces(args) if not t.WINDOWS else args)   # a path with a space through a link (xcrun.py no_spaces)
 
     def _map(args):
         if isinstance(args, (str, bytes)) or not args: return args
