@@ -27,6 +27,27 @@ def metal_args(sdk, args):
     return out
 
 
+def no_spaces(args):
+    """Off Windows, an absolute path with a space in it (a game folder named "Pokemon Legends") through a link without one: the Metal driver under Wine passes its arguments on to its
+    compiler split at spaces ("no such file or directory: 'Legends/…/x.air'"). The link names the path's folder (<temp>/nxw-paths/<digest>), so an output written through it lands there"""
+    import hashlib, tempfile
+    out = []
+    for a in args:
+        flag, path = '', a
+        for f in ('-I', '-L', '-F'):   # a path glued to its option
+            if a.startswith(f) and len(a) > 2: flag, path = f, a[2:]
+        if ' ' not in path or not os.path.isabs(path): out.append(a); continue
+        d, name = os.path.split(path)
+        if os.path.isdir(path) and not name: d, name = path, ''
+        if ' ' in name: out.append(a); continue   # a file name with a space: left as it is
+        links = os.path.join(tempfile.gettempdir(), 'nxw-paths'); os.makedirs(links, exist_ok=True)
+        ln = os.path.join(links, hashlib.sha256(d.encode()).hexdigest()[:16])
+        try: os.symlink(d, ln)
+        except FileExistsError: pass
+        out.append(flag + (os.path.join(ln, name) if name else ln))
+    return out
+
+
 def clang_args(args):
     sdk = tc.ios_sdk()
     if not sdk: die('no iPhoneOS SDK (set NXW_IOS_SDK or ios_sdk in win/toolchain.json; win/sdk/extract_xip.py extracts it from Xcode.xip)')
@@ -66,6 +87,7 @@ def main(argv):
     if not exe: die(f'no Windows tool for `xcrun -sdk {sdk} {tool}` (see win/README.md, Prerequisites)')
     if tool == 'metal': rest = metal_args(sdk, rest)
     elif tool == 'clang': rest = clang_args(rest)
+    if not tc.WINDOWS and exe.suffix.lower() == '.exe': rest = no_spaces(rest)
     return subprocess.run(tc.cmd(exe) + rest).returncode   # the Metal tools through Wine off Windows
 
 
