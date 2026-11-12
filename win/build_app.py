@@ -293,9 +293,9 @@ def main():
     if image and env.get('NXW_SPLIT_DATA', '') not in ('', '0'): die('a split build copies the RomFS as a folder, and this extraction is one RomFS image (RomFS.img): build without --split-data')
     game_dir = romfs.parent   # icon.jpg beside the game's RomFS, before the mods replace it
     if env.get('NXW_MODS_ROMFS'):   # mods' RomFS folders (win/mods.py): hard links of the game's files with the mods' laid over them, or a new image over a RomFS.img
-        import mods
+        import mods as game_mods   # not "mods": that name is the profile's module list
         mdirs = env['NXW_MODS_ROMFS'].split(os.pathsep)
-        romfs = rfs.Path(mods.overlay_image(romfs, mdirs, w / 'build/romfs_mods.img', log=t) if image else mods.overlay_romfs(romfs, mdirs, w / 'build/romfs_mods', log=t))
+        romfs = rfs.Path(game_mods.overlay_image(romfs, mdirs, w / 'build/romfs_mods.img', log=t) if image else game_mods.overlay_romfs(romfs, mdirs, w / 'build/romfs_mods', log=t))
     hdr = (DM / 'gfx/nvn/dmsh_chain.h').read_text(encoding='utf-8')
     v = (re.search(r'^#define DMSH_CHAIN "(.*)"', hdr, re.M) or die('no DMSH_CHAIN in dmsh_chain.h')).group(1)
     sys.path.insert(0, str(DM / 'tools')); import shader_lib   # an NVN game's libraries: the folder b-<chain> or the one file b-<chain>.img dmsh_build.py writes (dm/tools/shader_lib.py)
