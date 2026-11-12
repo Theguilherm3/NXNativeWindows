@@ -189,5 +189,21 @@ class PackIpa(unittest.TestCase):
             self.assertEqual(modes['Payload/DmIOS.app/Info.plist'] & 0o777, 0o644 if os.name == 'nt' else modes['Payload/DmIOS.app/Info.plist'] & 0o777)
 
 
+class Mods(unittest.TestCase):
+    def test_overlay_image(self):   # mods' RomFS folders over a RomFS.img: a new image, names matched without case, the game's name kept
+        import mods, romfs_image as ri
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d); g = d / 'game'; (g / 'Data/Sub').mkdir(parents=True)
+            (g / 'Data/a.bin').write_bytes(b'old'); (g / 'Data/Sub/keep.bin').write_bytes(b'keep'); (g / 'top.txt').write_bytes(b'top')
+            img = d / 'RomFS.img'; ri.pack(g, img)
+            m = d / 'mod'; (m / 'data/new').mkdir(parents=True); (m / 'data/A.bin').write_bytes(b'new!'); (m / 'data/new/n.bin').write_bytes(b'n')
+            out = mods.overlay_image(img, [m], d / 'out.img', log=lambda *_: None)
+            idx = ri.read_index(out); raw = out.read_bytes()
+            files = {p: raw[o:o + n] for p, (isdir, o, n) in idx.items() if not isdir}
+            self.assertEqual(files, {'Data/a.bin': b'new!', 'Data/Sub/keep.bin': b'keep', 'Data/new/n.bin': b'n', 'top.txt': b'top'})
+            logs = []; mods.overlay_image(img, [m], d / 'out.img', log=logs.append)
+            self.assertIn('reusing', logs[0])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

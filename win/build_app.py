@@ -290,11 +290,12 @@ def main():
     for m in mods:
         if not ((patched / f'{m}.patched.bin').exists() and (patched / f'{m}.fixups.tsv').exists()): die(f'no rewritten module {patched}/{m} (run dm/tools/patch_nso.py first)')
     if not (romfs / marker).exists(): die(f'no RomFS at {romfs} (missing {marker})')
-    if image and env.get('NXW_MODS_ROMFS'): die('mods\' RomFS folders are laid over a RomFS folder, and this extraction is one RomFS image (RomFS.img)')
     if image and env.get('NXW_SPLIT_DATA', '') not in ('', '0'): die('a split build copies the RomFS as a folder, and this extraction is one RomFS image (RomFS.img): build without --split-data')
-    if env.get('NXW_MODS_ROMFS'):   # mods' RomFS folders (win/mods.py): hard links of the game's files with the mods' laid over them
+    game_dir = romfs.parent   # icon.jpg beside the game's RomFS, before the mods replace it
+    if env.get('NXW_MODS_ROMFS'):   # mods' RomFS folders (win/mods.py): hard links of the game's files with the mods' laid over them, or a new image over a RomFS.img
         import mods
-        romfs = mods.overlay_romfs(romfs, env['NXW_MODS_ROMFS'].split(os.pathsep), w / 'build/romfs_mods', log=t)
+        mdirs = env['NXW_MODS_ROMFS'].split(os.pathsep)
+        romfs = rfs.Path(mods.overlay_image(romfs, mdirs, w / 'build/romfs_mods.img', log=t) if image else mods.overlay_romfs(romfs, mdirs, w / 'build/romfs_mods', log=t))
     hdr = (DM / 'gfx/nvn/dmsh_chain.h').read_text(encoding='utf-8')
     v = (re.search(r'^#define DMSH_CHAIN "(.*)"', hdr, re.M) or die('no DMSH_CHAIN in dmsh_chain.h')).group(1)
     sys.path.insert(0, str(DM / 'tools')); import shader_lib   # an NVN game's libraries: the folder b-<chain> or the one file b-<chain>.img dmsh_build.py writes (dm/tools/shader_lib.py)
@@ -390,7 +391,7 @@ def main():
       ents = {'com.apple.developer.kernel.increased-memory-limit': True}
       t(f'entitlements asked for: {", ".join(ents)} (' + str(macho_sign.sign(str(app / 'DmIOS'), bundle_id, ents)) + '-byte ad-hoc signature)')
 
-    icon = Path(env.get('DM_ICON') or romfs.parent / 'icon.jpg')
+    icon = Path(env.get('DM_ICON') or game_dir / 'icon.jpg')
     icons = icon.exists() and make_icons(icon, app)
     if not icon.exists(): t(f'no app icon ({icon} not found): the home-screen icon stays blank')
     with open(app / 'Info.plist', 'wb') as f:

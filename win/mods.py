@@ -5,7 +5,7 @@
 # Code patches become rewriter cuts (dm/tools/patch_nso.py "Registered patches": the original bytes are asserted, then replaced before the rewrite), so they reach the iPhone
 # as the profile's own patches do: they apply only to the module whose build ID they name, and a patch for another game version is reported and skipped.
 # A patch overlapping a cut the game profile already makes is skipped too (the profile's fix wins). RomFS files are overlaid on the packed version's RomFS by hard links.
-import os, re, struct, sys
+import json, os, re, struct, sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -139,3 +139,62 @@ def overlay_romfs(romfs, mod_dirs, dest, log=print):
     stamp.write_text(sig, encoding='utf-8')
     log(f'mods: RomFS with {replaced} file(s) replaced and {added} added ({len(files):,} files, hard links)')
     return dest
+
+
+def overlay_image(image, mod_dirs, dest, log=print):
+    """the RomFS image (DMROMFS1, dm/tools/romfs_image.py) with each mod folder's files laid over it (later mods win), written as a new image dest; reused when nothing changed.
+    Names match without case, as overlay_romfs does; a replaced file keeps the game's name."""
+    import romfs_image as ri
+    image, dest = os.fspath(image), os.fspath(dest)
+    root = {}   # name -> dict (directory) or source: ('img', offset, size) | host path
+    def node(d, name, isdir):   # d's child named name (without case), made when missing
+        for k in d:
+            if k.lower() == name.lower() and isinstance(d[k], dict) == isdir: return k
+        if isdir: d[name] = {}
+        return name
+    for p, (isdir, off, size) in sorted(ri.read_index(image).items()):
+        d, *parts = [root] + p.split('/')
+        for part in parts[:-1]: d = d.setdefault(part, {})
+        if isdir: d.setdefault(parts[-1], {})
+        else: d[parts[-1]] = ('img', off, size)
+    replaced = added = 0
+    for md in mod_dirs:
+        for dp, _, fns in os.walk(md):
+            rel = os.path.relpath(dp, md)
+            d = root
+            for part in ([] if rel == '.' else rel.replace(os.sep, '/').split('/')): d = d[node(d, part, True)]
+            for f in fns:
+                k = node(d, f, False)
+                if k in d: replaced += 1
+                else: added += 1
+                d[k] = os.path.join(dp, f)
+    ents = [[b'', root, True, 0, 0]]
+    i = 0
+    while i < len(ents):   # breadth-first, each directory's children sorted by name bytes (romfs_image.entries)
+        if ents[i][2]:
+            kids = sorted((k.encode(), v) for k, v in ents[i][1].items())
+            ents[i][3], ents[i][4] = len(ents), len(kids)
+            ents.extend([n, v, isinstance(v, dict), 0, 0] for n, v in kids)
+        i += 1
+    st = os.stat(image)
+    sig = json.dumps([Path(ri.__file__).read_bytes().hex()[:64], [st.st_size, st.st_mtime_ns], replaced, added,
+                      [[md, max((os.path.getmtime(os.path.join(dp, f)) for dp, _, fns in os.walk(md) for f in fns), default=0)] for md in map(os.fspath, mod_dirs)]])
+    stamp = Path(dest + '.mods.json')
+    if Path(dest).is_file() and stamp.is_file() and stamp.read_text(encoding='utf-8') == sig:
+        log(f'mods: reusing the RomFS image with {replaced} file(s) replaced and {added} added ({dest})'); return Path(dest)
+    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+    src = open(image, 'rb')
+    def copy(s, out):
+        if isinstance(s, str): return ri.copy_file(s, out)
+        _, off, size = s; src.seek(off); left = size
+        while left:
+            b = src.read(min(left, 8 << 20))
+            if not b: raise OSError(f'{image}: cut off at {off + size - left}')
+            out.write(b); left -= len(b)
+        return size
+    try: part = ri.write(ents, dest, copy)
+    finally: src.close()
+    os.replace(part, dest)
+    stamp.write_text(sig, encoding='utf-8')
+    log(f'mods: RomFS image with {replaced} file(s) replaced and {added} added ({len(ents):,} entries, {dest})')
+    return Path(dest)
