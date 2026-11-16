@@ -19,16 +19,20 @@ Verified on Windows 11 with LLVM 23.1.4, Metal Developer Tools for Windows 6.2 (
 | `xcrun -sdk iphoneos/macosx metal`, `metallib` | Apple's **Metal Developer Tools for Windows** (`metal.exe`, `metallib.exe`). `-mios-version-min=X` becomes `-target air64-apple-iosX`. | `win/xcrun.py` |
 | `xcodegen` + `xcodebuild` (C, ObjC, asm, Swift) | **LLVM clang** (`-target arm64-apple-ios26.0 -isysroot iPhoneOS.sdk`), one compile per file, linked by **ld64.lld** | `win/build_app.py` |
 | `Launcher.swift` (SwiftUI) | `win/ios/Launcher.m`: a UIKit port with the same `dm_show_launcher` contract, so no Swift toolchain is needed | `win/ios/Launcher.m` |
+| `GameMenu.swift` (the in-game menu) | `win/ios/GameMenu.m`: `dm_game_menu` with the controller layout; the live launcher settings stay on the settings screen | `win/ios/GameMenu.m` |
 | Darwin compiler-rt (`@available`) | `win/ios/compat_rt.c` (`__isPlatformVersionAtLeast` through `_availability_version_check`), used only when LLVM has no `libclang_rt.ios.a` | `win/ios/compat_rt.c` |
 | `actool` asset catalog | loose PNG icons named in `CFBundleIcons`, scaled by Pillow | `win/build_app.py` |
 | `sips`, `plutil` | Pillow, `plistlib` | `win/build_app.py` |
-| `make -n -B dmhost` (source list) | the `dm/host/Makefile` source rules, reproduced. The build stops if the Makefile's `SRC=` / `GFX=` lines change. | `build_app.host_sources()` |
-| `dmsh_xlate` apphost (Mach-O) | `dotnet dmsh_xlate.dll`: the same locked DLLs, so the chain fingerprints still match `dmsh_chain.lock` | `win/pyshim/sitecustomize.py` |
+| `make -n -B dmhost MSL_SDK=iphoneos` (source list) | the `dm/host/Makefile` source rules (host, libvpx, dav1d), reproduced, and the host's own shaders compiled into `host_msl_gen.h` by `host_msl.py`. The build stops if the Makefile lines it follows change (`MK_LINES`). | `build_app.host_sources()` |
+| `dmsh_xlate` (a native Mach-O upstream) | `dotnet dmsh_xlate.dll`, built from the same in-repo source (below), so it embeds the same source digest that `tool_lock.py --check-tools` compares | `win/pyshim/sitecustomize.py` |
+| `nx_extract` (a native Mach-O upstream) | built from `dm/tools/nx_extract` with `dotnet build` once per source digest, into `win/build/nx_extract/<digest>` | `win/build_ipa_windows.py` (`find_nx_extract`) |
 | `which`, `python3`, `ctypes.CDLL(None)` (clonefile) | `shutil.which`, the current Python, an empty library (falls back to plain copies) | `win/pyshim/sitecustomize.py` |
 | Unix modes in the IPA (the executable's x bit) | `pack_ipa.py --exec`: on Windows, folders are packed as 755, the executable as 755, other files as 644 | `dm/ios/tools/pack_ipa.py` |
 | iPhoneOS SDK from Xcode | `win/sdk/extract_xip.py` streams `Xcode_26.xip` (xar, then pbzx, then cpio) and writes only `iPhoneOS.sdk` | `win/sdk/extract_xip.py` |
 
-These steps already run on Windows as they are: `nx_extract` (.NET, LibHac), the NSO rewriter (`patch_nso.py`), shader translation (`dmsh_xlate`), spirv-cross, reflection and tables (`dmsh_build.py`, `c1_guard.py`, `cb_extent.py`), and `pack_ipa.py`.
+**After an upstream sync that changes the translator's source** (`dm/gfx/tools/dmsh_xlate/`, `dm/third_party/ryujinx`), rebuild the DLLs and commit them: `dotnet build dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj -c Release -o <tmp>`, then copy everything but the `dmsh_xlate` apphost into `dm/gfx/tools/dmsh_xlate_bin` (the Mach-O there is upstream's and stays). `dotnet <tmp>/dmsh_xlate.dll --source-sha` must print the lock's `xlate_source`, and the DLLs must be AnyCPU (an arm64 PE does not load on Windows x64).
+
+These steps already run on Windows as they are: the NSO rewriter (`patch_nso.py`), shader translation (`dmsh_xlate`), spirv-cross, reflection and tables (`dmsh_build.py`, `c1_guard.py`, `cb_extent.py`), and `pack_ipa.py`.
 
 ### LÖVE games without the Mac host
 
