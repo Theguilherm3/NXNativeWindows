@@ -34,6 +34,9 @@ def setting(key, default=None):
 
 if not WINDOWS:
     os.environ.setdefault('WINEDEBUG', '-all')   # Wine's own fixme / err lines would fill the shader build's logs
+    # Headless Wine: with a graphics driver, every wineserver start runs explorer.exe, which maps an X window and drops it when the server exits. Dozens of
+    # metal.exe runs made windows come and go under load, and gnome-shell (mutter 46) aborted on a BadWindow from X_SendEvent to one already gone (win/LINUX.md)
+    os.environ.setdefault('WINEDLLOVERRIDES', 'winex11.drv=d;winewayland.drv=d')
     if setting('wineprefix'): os.environ.setdefault('WINEPREFIX', os.path.expanduser(setting('wineprefix')))   # a prefix of its own keeps the Metal compiler's module cache apart
 
 
