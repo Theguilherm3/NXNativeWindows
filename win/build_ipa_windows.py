@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # NSP → IPA on Windows: runs the upstream pipeline (scripts/build_ipa_from_nsp.py) unchanged, with its macOS-only steps replaced:
 #   check_prereqs        → the Windows toolchain (win/doctor.py)
-#   build_nx_extract     → the same dotnet build, which on Windows writes nx_extract.exe
+#   find_nx_extract      → nx_extract built from its in-repo source by dotnet (win/build/nx_extract/<source digest>): the committed one is a Mach-O
 #   can_clone            → False (no APFS clones; nx_extract writes plain copies)
 #   toolchain()          → the Windows Metal compiler's and spirv-cross's versions (shader cache keys)
 #   build_ipa.sh         → win/build_app.py (through win/pyshim/sitecustomize.py, which also maps xcrun / dmsh_xlate / which)
@@ -69,15 +69,24 @@ def main():
         if not xlate.parent.is_dir(): raise BuildError(f'the shader translator is missing from the repository: {xlate}')
     up.check_prereqs = check_prereqs
 
-    def build_nx_extract(repo, work, logs, env):
-        import tempfile, shutil
-        nx = work / 'tools/nx_extract/nx_extract'
-        with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:
-            up.run(['dotnet', 'build', repo / 'dm/tools/nx_extract', '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
-            if not (Path(t) / 'nx_extract.exe').exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
-            up.rmtree(nx.parent); shutil.copytree(t, nx.parent)
-        return nx   # Windows starts nx_extract.exe for this path
-    if tc.WINDOWS: up.build_nx_extract = build_nx_extract   # on Linux dotnet writes nx_extract, as upstream expects
+    # nx_extract: upstream runs its committed native executable (dm/tools/nx_extract_bin/nx_extract, a Mach-O), which cannot run here. The same in-repo source is built with dotnet
+    # instead, once per source digest, into win/build/nx_extract/<digest>; as upstream's find_nx_extract, it must report that digest (--source-sha) before it extracts anything
+    def find_nx_extract(repo, env):
+        import tempfile
+        want = up.nx_extract_source_sha(repo)
+        d = WIN / 'build/nx_extract' / want
+        exe = d / ('nx_extract.exe' if tc.WINDOWS else 'nx_extract')
+        if not exe.exists():
+            up.say(f'nx_extract: building it from dm/tools/nx_extract (dotnet build, source {want})')
+            with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:
+                r = subprocess.run(['dotnet', 'build', str(repo / 'dm/tools/nx_extract'), '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], capture_output=True, text=True, env=env)
+                if r.returncode or not (Path(t) / exe.name).exists(): raise BuildError('nx_extract did not build: ' + ((r.stdout + r.stderr).strip().splitlines() or ['no executable'])[-1])
+                up.rmtree(d); shutil.copytree(t, d)
+        try: r = subprocess.run([str(exe), '--source-sha'], capture_output=True, text=True, env=env, timeout=60, errors='replace')
+        except (OSError, subprocess.SubprocessError) as e: raise BuildError(f'nx_extract does not start ({e}): {exe}') from e
+        if r.stdout.strip() != want: raise BuildError(f'nx_extract does not run or was not built from the in-repo source (it says {r.stdout.strip() or r.stderr.strip()[:200]} / in repo {want}): delete {d}')
+        return exe
+    up.find_nx_extract = find_nx_extract
 
     # address-region cuts for an sdk build sdk_patches.py does not register (win/sdk_auto_cuts.py), for a game with virtual address memory: written beside the rewrite, read by the
     # shim when patch_nso.py imports sdk_patches, and part of the rewrite's cache key (patch_files)

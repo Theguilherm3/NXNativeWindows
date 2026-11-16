@@ -21,6 +21,7 @@ IOS = DM / 'ios'
 HOST = DM / 'host'
 sys.path.insert(0, str(DM / 'tools'))
 import romfs as rfs   # the RomFS as a folder or as one DMROMFS1 image (nx_extract --romfs-image), read alike
+import shader_lib     # an NVN game's shader libraries: the folder b-<chain>/ or the one file b-<chain>.img that dmsh_build.py writes
 
 
 def t(msg): print(f'[{time.strftime("%H:%M:%S")}] {msg}', flush=True)
@@ -34,16 +35,31 @@ def py(*args, env=None, capture=True):
 
 
 # ---- dm/host/Makefile, reproduced ----
-def host_sources(game_h_dir):
-    """(sources, include dirs) exactly as `make -n -B dmhost` lists them: SRC, GFX and the libvpx objects' sources; the include order of the host's link line, then libvpx's"""
+MK_LINES = (   # the dm/host/Makefile lines host_sources() reproduces: a change to any of them stops the build until host_sources() follows it
+    'SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m pad_switch2_apple.m $(sort $(wildcard hle_*.c)) front_mac.m web_apple.m entry.S',
+    'GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))',
+    'DAV1D_SRC=$(sort $(filter-out %_tmpl.c,$(wildcard $(DAV1D)/src/*.c)) $(DAV1D)/src/arm/cpu.c $(wildcard $(DAV1D)/config/tmpl/*.c) \\\n'
+    '          $(filter-out %_tmpl.S %/util.S,$(wildcard $(DAV1D)/src/arm/64/*.S)))',
+    'HOST_CFLAGS = $(CFLAGS) -I../gfx/nvn/include -I$(dir $(MSL_H)) -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I$(DAV1D)/include -I../third_party/stb_vorbis -fobjc-arc',
+    'MSL_SRC = $(sort $(wildcard ../gfx/msl/*.metal))',
+)
+
+
+def msl_min_iphoneos():
+    """MSL_MIN_iphoneos of dm/host/Makefile: the deployment target the host's own shaders are compiled for (host_msl.py --min)"""
+    m = re.search(r'^MSL_MIN_iphoneos\s*=\s*(\S+)', (HOST / 'Makefile').read_text(encoding='utf-8'), re.M)
+    return m.group(1) if m else die('dm/host/Makefile has no MSL_MIN_iphoneos line: update win/build_app.py')
+
+
+def host_sources(game_h_dir, msl_h_dir):
+    """(sources, include dirs) exactly as `make -n -B dmhost MSL_SDK=iphoneos` lists them (dm/ios/tools/gen_build.py): SRC, GFX and the libvpx and dav1d objects' sources; the include
+    order of the host's compile line, then libvpx's and dav1d's"""
     mk = (HOST / 'Makefile').read_text(encoding='utf-8')
-    want_src = 'SRC=main.c loader.c hle.c crash.c probe.c thread.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m entry.S'
-    want_gfx = 'GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))'
-    for w in (want_src, want_gfx):
-        if w not in mk: die(f'dm/host/Makefile changed ({w.split("=")[0]}= line): update host_sources() in win/build_app.py')
-    src = [HOST / n for n in 'main.c loader.c hle.c crash.c probe.c thread.c memstat.m haptics_apple.m'.split()]
+    for w in MK_LINES:
+        if w not in mk: die(f'dm/host/Makefile changed ({w.split("=")[0].strip()}= line): update host_sources() in win/build_app.py')
+    src = [HOST / n for n in 'main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m pad_switch2_apple.m'.split()]
     src += sorted(HOST.glob('hle_*.c'), key=lambda p: p.name)
-    src += [HOST / 'front_mac.m', HOST / 'entry.S']
+    src += [HOST / 'front_mac.m', HOST / 'web_apple.m', HOST / 'entry.S']
     gfx = []
     for pat in ('../gfx/*.c', '../gfx/nvn/*.c', '../gfx/nvn/*.m', '../gfx/nvn/*.S', '../gfx/tex/*.c', '../gfx/tex/*.m', '../gfx/vk/*.m', '../gfx/gl/*.m'):
         d, g = pat.rsplit('/', 1)
@@ -51,9 +67,15 @@ def host_sources(game_h_dir):
     gfx = sorted(gfx, key=lambda p: os.path.relpath(p, HOST).replace('\\', '/'))   # make's $(sort) orders the words as text
     vpx = DM / 'third_party/libvpx'
     vpx_src = sorted(vpx.rglob('*.c'), key=lambda p: p.as_posix())
-    incs = [DM / 'gfx/nvn/include', DM / 'third_party/vulkan-headers/include', game_h_dir, vpx, DM / 'third_party/stb_vorbis', vpx / 'config']
+    # dav1d, the AV1 decoder (hle_movie_av1.c): its C sources but the *_tmpl.c ones (built through config/tmpl's per-bit-depth wrappers), and its arm64 assembly but the files other
+    # assembly files include (*_tmpl.S, util.S), as DAV1D_SRC
+    dav = DM / 'third_party/dav1d'
+    dav_src = [p for p in (dav / 'src').glob('*.c') if not p.name.endswith('_tmpl.c')] + [dav / 'src/arm/cpu.c'] + list((dav / 'config/tmpl').glob('*.c'))
+    dav_src = sorted(dav_src, key=lambda p: p.as_posix()) + sorted((p for p in (dav / 'src/arm/64').glob('*.S') if not p.name.endswith('_tmpl.S') and p.name != 'util.S'), key=lambda p: p.as_posix())
+    incs = [DM / 'gfx/nvn/include', msl_h_dir, DM / 'third_party/vulkan-headers/include', game_h_dir, vpx, dav / 'include', DM / 'third_party/stb_vorbis',
+            vpx / 'config', dav, dav / 'config']
     files = []
-    for s in src + gfx + vpx_src:
+    for s in src + gfx + vpx_src + dav_src:
         s = s.resolve()
         if s.stem.endswith('_mac'): continue   # Mac-only sources (front_mac.m): front_ios.m implements front.h
         if s.parent == (IOS / 'Sources').resolve(): continue   # iOS sources the host borrows are compiled once, as iOS sources
@@ -61,7 +83,8 @@ def host_sources(game_h_dir):
     dirs = []
     for s in files:
         if s.parent not in dirs: dirs.append(s.parent)
-    return files, [Path(i).resolve() for i in incs] + [d for d in dirs if d not in incs]
+    incs = list(dict.fromkeys(Path(i).resolve() for i in incs))
+    return files, incs + [d for d in dirs if d not in incs]
 
 
 FRAMEWORKS_BASE = ['QuartzCore', 'Metal', 'MetalFX', 'GameController', 'CoreHaptics', 'AudioToolbox', 'VideoToolbox', 'CoreMedia', 'CoreVideo', 'ImageIO', 'UniformTypeIdentifiers',   # dm/host/Makefile minus Cocoa
@@ -80,9 +103,11 @@ def frameworks(sdk, files):
 
 
 # ---- compile + link ----
+# -mcpu=apple-m1, as dm/ios/project.yml: it has the LSE atomics the host assembly uses, and no newer feature; dav1d turns on every feature the target promises, and an A18 target
+# (its I8MM) stopped an M1 iPad with SIGILL in the AV1 decoder (dm/ios/tests/test_cpu_target.py)
 def compile_all(clang, sdk, files, incs, obj_dir, extra_defs):
     target = f'arm64-apple-ios{tc.setting("ios_deployment", tc.IOS_DEPLOYMENT)}'
-    common = ['-target', target, '-isysroot', str(sdk), '-Os', '-mcpu=apple-a18', '-w', '-fno-common', '-DNS_BLOCK_ASSERTIONS=1', *extra_defs] + [f'-I{i}' for i in incs]
+    common = ['-target', target, '-isysroot', str(sdk), '-Os', '-mcpu=apple-m1', '-w', '-fno-common', '-DNS_BLOCK_ASSERTIONS=1', *extra_defs] + [f'-I{i}' for i in incs]
     obj_dir.mkdir(parents=True, exist_ok=True)
     jobs, objs = [], []
     for f in files:
@@ -154,14 +179,16 @@ def info_plist(bundle_id, name, version, category, show_fps, lang, sdk_ver, sdk_
         'CFBundleSupportedPlatforms': ['iPhoneOS'], 'DTPlatformName': 'iphoneos', 'DTPlatformVersion': sdk_ver, 'DTSDKName': f'iphoneos{sdk_ver}', 'DTSDKBuild': sdk_build,
         'MinimumOSVersion': tc.setting('ios_deployment', tc.IOS_DEPLOYMENT), 'LSRequiresIPhoneOS': True, 'UIDeviceFamily': [1, 2], 'UIRequiredDeviceCapabilities': ['arm64'],
         # dm/ios/project.yml info.properties
-        'UILaunchStoryboardName': '', 'UIFileSharingEnabled': True, 'LSSupportsOpeningDocumentsInPlace': True,
+        'UILaunchScreen': {}, 'UIFileSharingEnabled': True, 'LSSupportsOpeningDocumentsInPlace': True,
         'UISupportedInterfaceOrientations': ['UIInterfaceOrientationLandscapeRight', 'UIInterfaceOrientationLandscapeLeft'],
-        'UISupportedInterfaceOrientations~ipad': ['UIInterfaceOrientationLandscapeRight', 'UIInterfaceOrientationLandscapeLeft'],
-        'UIRequiresFullScreen': True, 'UIStatusBarHidden': True, 'UIViewControllerBasedStatusBarAppearance': False, 'LSApplicationCategoryType': category,
+        'UISupportedInterfaceOrientations~ipad': ['UIInterfaceOrientationPortrait', 'UIInterfaceOrientationPortraitUpsideDown', 'UIInterfaceOrientationLandscapeRight', 'UIInterfaceOrientationLandscapeLeft'],
+        'UIStatusBarHidden': True, 'UIViewControllerBasedStatusBarAppearance': False, 'LSApplicationCategoryType': category,
         'DMShowFPS': show_fps, 'DMLanguage': lang, 'LSSupportsGameMode': True, 'GCSupportsControllerUserInteraction': True,
         'GCSupportedGameControllers': [{'ProfileName': 'ExtendedGamepad'}], 'CADisableMinimumFrameDurationOnPhone': True,
         'UIApplicationSceneManifest': {'UIApplicationSupportsMultipleScenes': False, 'UISceneConfigurations': {'UIWindowSceneSessionRoleApplication': [
-            {'UISceneConfigurationName': 'Default', 'UISceneDelegateClassName': 'SceneDelegate'}]}},
+            {'UISceneConfigurationName': 'Default', 'UISceneDelegateClassName': 'SceneDelegate'}],
+            # a TV by cable or AirPlay: the game's picture goes there, the phone keeps the pad (front_ios.m DmTVSceneDelegate)
+            'UIWindowSceneSessionRoleExternalDisplayNonInteractive': [{'UISceneConfigurationName': 'TV', 'UISceneDelegateClassName': 'DmTVSceneDelegate'}]}},
     }
     # The data ZIP import (win/ios/DataHelp.m) runs as a continued-processing task on iOS 26 and later: it goes on in the background with a Live Activity. Its identifiers are
     # <bundle ID>.import.<n> (a signer that changes the bundle ID makes the request fail, and the import runs in the foreground instead)
@@ -191,6 +218,7 @@ def list_files(src):
     Listed once per build"""
     src = Path(src)
     if src in _LISTED: return _LISTED[src]
+    if src.is_file(): _LISTED[src] = [(str(src), '', src.stat().st_size)]; return _LISTED[src]   # one file (a shader library image): its path inside is the part's own
     out, stack = [], [(str(src), '')]
     while stack:
         d, rel = stack.pop()
@@ -208,7 +236,7 @@ def split_data(data, parts, stamp, name, skip_suffix=()):
     (another drive). A folder that a build with the same stamp and the same files filled is kept as it is; otherwise it is made again in <folder>.partial and swapped in,
     so it never mixes files from two builds. Returns (files, bytes)"""
     import concurrent.futures as cf
-    todo = [(f, f'{rel}/{r}', n) for rel, src in parts.items() for f, r, n in list_files(src) if not r.endswith(tuple(skip_suffix))]
+    todo = [(f, f'{rel}/{r}' if r else rel, n) for rel, src in parts.items() for f, r, n in list_files(src) if not (r and r.endswith(tuple(skip_suffix)))]
     count, size = len(todo), sum(n for _, _, n in todo)
     sig = stamp + f'files\t{count}\nbytes\t{size}\n'
     if (data / 'nxw_data.tsv').is_file() and (data / 'nxw_data.tsv').read_text(encoding='utf-8') == sig:
@@ -292,14 +320,17 @@ def main():
         msldir = 'gl'
     else:
         msldir = f'b-{v}'
-        if not list((msl_ios / msldir).glob('*_b.metallib')): die(f'no iOS shader libraries {msl_ios}/{msldir}')
+        if not shader_lib.has_library(msl_ios / msldir): die(f'no iOS shader libraries {msl_ios}/{msldir} (or {msldir}.img)')
         inputs = py(DM / 'gfx/tools/dmsh_chain.py', '--inputs', env=dict(env, DM_GAME=game))
-        stamp = (msl_ios / msldir / 'inputs.tsv')
-        lines = stamp.read_text(encoding='utf-8').splitlines() if stamp.exists() else []
-        if f'game\t{game}' not in lines or f'inputs\t{inputs}' not in lines: die(f'the iOS shader libraries {msl_ios}/{msldir} are not a full build from this profile\'s current tables (inputs {inputs})')
+        st = shader_lib.read_stamp(msl_ios / msldir)
+        if st.get('game') != game or st.get('inputs') != inputs: die(f'the iOS shader libraries {msl_ios}/{msldir} are not a full build from this profile\'s current tables (inputs {inputs})')
         c1 = gd / 'c1_full.tsv'
-        if not (c1.exists() and c1.read_text(encoding='utf-8').splitlines()[:1] and c1.read_text(encoding='utf-8').splitlines()[0].startswith(f'# chain b-{v} inputs {inputs} ')):
+        head = c1.read_text(encoding='utf-8').splitlines()[:1] if c1.exists() else []
+        if not (head and head[0].split()[:5] == ['#', 'chain', f'b-{v}', 'inputs', inputs]):
             die(f'{c1} is missing or not made from these libraries (chain {v}, inputs {inputs})')
+    # the libraries as dmsh_build.py left them: the one file b-<chain>.img (an NVN game's, read in place by the host: msl_image.h), else the folder
+    msl_src = Path(shader_lib.view(msl_ios / msldir)) if msldir.startswith('b-') else msl_ios / msldir
+    msl_arc = f'msl/{msldir}.img' if msl_src.suffix == '.img' else f'msl/{msldir}'
 
     sdk = tc.ios_sdk() or die('no iPhoneOS SDK: set NXW_IOS_SDK (win/sdk/extract_xip.py extracts it from Xcode.xip)')
     clang = tc.llvm_tool('clang') or die('no clang: install LLVM for Windows (https://github.com/llvm/llvm-project/releases)')
@@ -314,7 +345,8 @@ def main():
     (gen / 'profile').mkdir(parents=True); app.mkdir(parents=True)
     t('generate Gen/ (profile header, embedded modules, tables)')
     py(DM / 'games/game.py', 'header', game, gen / 'profile/game_profile.h')
-    flags = py(IOS / 'tools/gen_embed.py', patched, gen / 'embed.S', *mods)
+    jit = romfs.parent / 'jit/jit.img'   # the nn::jit image (dm/tools/jit_capture.py), beside the RomFS (build_ipa.sh)
+    flags = py(IOS / 'tools/gen_embed.py', *(['--jit', jit] if jit.is_file() else []), patched, gen / 'embed.S', *mods)
     es = gen / 'embed.S'
     es.write_text(re.sub(r'\.incbin "([^"]*)"', lambda m: '.incbin "' + m.group(1).replace('\\', '/') + '"', es.read_text(encoding='utf-8')), encoding='utf-8')   # assembler strings take \ as an escape
 
@@ -344,14 +376,20 @@ def main():
     elif gfx == 'nvn': t('no pipeline archive (' + (f'DM_PSO_GPUS={gpus}' if 'DM_PSO_GPUS' in env else 'the profile does not set pso_mtl4 on; DM_PSO_GPUS=g18p builds one')
                          + ('' if (gd / 'shader_pairs.tsv').exists() else ', no shader_pairs.tsv') + ')')
     t('launcher: ' + py(DM / 'games/settings.py', game, patched, vnacp, dmres / 'launcher.json', env=dict(env, GFXAPI=gfx)))
+    # The game's control data, which the host answers control-property queries from (hle_fs.c control_read: fs::GetCacheStorageMax); main.m names it in DM_CONTROL_NACP (build_ipa.sh)
+    if vnacp.exists(): shutil.copy2(vnacp, dmres / 'control.nacp')
+    else: t(f'[RED] no control data at {vnacp}: fs::GetCacheStorageMax fails in the app')
     if env.get('DM_ENV_FILE'): shutil.copy2(env['DM_ENV_FILE'], dmres / 'env.txt')
     (dmres / 'font').mkdir()
     font = tc.std_font() or die('no standard font: set STD_FONT to a TTF with broad Unicode coverage')
     shutil.copy2(font, dmres / 'font/standard.ttf'); t(f'standard font: {font}')
     py(DM / 'tools/make_ext_font.py', dmres / 'font/nintendo_ext.ttf', tc.letter_font() or die('no bold TTF for the button icons: set LETTER_FONT'))
 
-    files, incs = host_sources(gen / 'profile')
-    files += [p.resolve() for p in sorted((IOS / 'Sources').glob('*.m'))] + [(WIN / 'ios/Launcher.m').resolve(), (WIN / 'ios/DataHelp.m').resolve(), (WIN / 'ios/nxw_unzip.c').resolve(), es.resolve()]
+    # The host's own Metal shaders compiled for iOS into a header (dm/gfx/tools/host_msl.py, as make host_msl MSL_SDK=iphoneos): without a Metal compiler it holds their sources, and the host compiles them
+    msl_h = gen / 'msl-iphoneos/host_msl_gen.h'; msl_h.parent.mkdir(parents=True, exist_ok=True)
+    py(DM / 'gfx/tools/host_msl.py', '--sdk', 'iphoneos', '--min', msl_min_iphoneos(), msl_h, *sorted((DM / 'gfx/msl').glob('*.metal')))
+    files, incs = host_sources(gen / 'profile', msl_h.parent)
+    files += [p.resolve() for p in sorted((IOS / 'Sources').glob('*.m'))] + [(WIN / f'ios/{n}').resolve() for n in ('Launcher.m', 'GameMenu.m', 'DataHelp.m', 'nxw_unzip.c')] + [es.resolve()]
     fws = frameworks(sdk, files)
     rt = compat_rt_needed(clang)
     if rt:
@@ -378,7 +416,7 @@ def main():
         sp = env.get('NXW_SPLIT_DATA', '')
         if sp and sp != '0':   # a split build: the app's "game data needed" screen (win/ios/DataHelp.m) names the data folder and its size
             dname = Path(sp).name if sp not in ('1', 'YES') else out_ipa.stem + '-data'
-            dsize = sum(n for d in (romfs, msl_ios / msldir, aoc if aoc and aoc.is_dir() else None) if d for _, _, n in list_files(d))   # listed once, reused by split_data
+            dsize = sum(n for d in (romfs, msl_src, aoc if aoc and aoc.is_dir() else None) if d for _, _, n in list_files(d))   # listed once, reused by split_data
             pl['NXWDataFolder'] = dname; pl['NXWDataSize'] = f'{dsize / 2**30:.1f} GB' if dsize >= 2**30 else f'{dsize / 2**20:.0f} MB'
         plistlib.dump(pl, f, fmt=plistlib.FMT_BINARY)
     (app / 'PkgInfo').write_bytes(b'APPL????')
@@ -386,6 +424,10 @@ def main():
     has_aoc = bool(aoc and aoc.is_dir() and any(aoc.iterdir()))
     if has_aoc: t('add-on content: ' + ' '.join(sorted(p.name for p in aoc.iterdir())))
     split = env.get('NXW_SPLIT_DATA', '')
+    # beside the RomFS, where the host finds them (build_ipa.sh): offline HTML pages (hle_web.c), the nn::jit image (loader.c dm_jit_serve_dir), the other programs' RomFS (hle_fs.c MountRom);
+    # in the data folder for a split build, whose RomFS is there
+    beside = {d: Path(str(romfs.parent / d)) for d in ('html', 'jit', 'romfs_programs') if (romfs.parent / d).is_dir()}
+    for d, src in beside.items(): t(f'{d}: {src}')
     maps = [f'Payload/DmIOS.app={app}']
     if pso: maps.append(f'Payload/DmIOS.app/pso={pso}')
     # The pulling vertex libraries (<key>_bp) serve the hybrid pipelines: packed when the profile compiles pso_mtl4 in (DM_GAME_PSO_MTL4), or IOS_PULL=1, and always with an archive (build_ipa.sh)
@@ -396,16 +438,17 @@ def main():
         # Split build: the IPA holds only the app (small, quick to sign and install); the game files and shader libraries go to a data folder the player copies
         # into the app's Documents (dm/ios/Sources/main.m looks for <Documents>/romfs and <Documents>/<folder>/romfs, and takes msl/ and aoc/ beside it)
         data = Path(split) if split not in ('1', 'YES') else out_ipa.with_name(out_ipa.stem + '-data')
-        split_data(data, {'romfs': romfs, f'msl/{msldir}': msl_ios / msldir, **({'aoc': aoc} if has_aoc else {})},
+        split_data(data, {'romfs': romfs, msl_arc: msl_src, **({'aoc': aoc} if has_aoc else {}), **beside},
                    f'game\t{game}\nbundle_id\t{bundle_id}\nversion\t{version}\nchain\t{v}\ngfx\t{gfx}\n', name, skip_suffix=('_bp.metallib',) if skip_bp else ())
     else:
-        maps.append(f'Payload/DmIOS.app/msl/{msldir}={msl_ios / msldir}')
+        maps.append(f'Payload/DmIOS.app/msl/{msldir}={msl_src}')   # pack_ipa.py takes an image as msl/<folder>.img (library_map)
         if has_aoc: maps.append(f'Payload/DmIOS.app/aoc={aoc}')
         maps.append(f'Payload/DmIOS.app/romfs.img={romfs}' if image else f'Payload/DmIOS.app/romfs={romfs}')   # main.m romfs_locate opens <App>/romfs.img (build_ipa.sh)
+        for d, src in beside.items(): maps.append(f'Payload/DmIOS.app/{d}={src}')
     t('pack IPA (already-compressed game files stored, everything else deflated)')
     r = subprocess.run([sys.executable, str(IOS / 'tools/pack_ipa.py'), str(out_ipa), '--store', ':'.join(gp('zip_store').split(':')),
                         '--exec', 'Payload/DmIOS.app/DmIOS', '--skip', 'Payload/DmIOS.app/msl', '--skip', 'Payload/DmIOS.app/aoc', '--skip', 'Payload/DmIOS.app/romfs', '--skip', 'Payload/DmIOS.app/romfs.img',
-                        '--skip', 'Payload/DmIOS.app/pso', *(['--skip-suffix', '_bp.metallib'] if skip_bp else []), *maps])
+                        '--skip', 'Payload/DmIOS.app/pso', '--skip', 'Payload/DmIOS.app/html', '--skip', 'Payload/DmIOS.app/jit', '--skip', 'Payload/DmIOS.app/romfs_programs', *(['--skip-suffix', '_bp.metallib'] if skip_bp else []), *maps])
     if r.returncode: die('pack_ipa')
     sz = out_ipa.stat().st_size; t(f'done: {out_ipa} ({sz / 2**30:.1f} GB)' if sz >= 2**30 else f'done: {out_ipa} ({sz / 2**20:.1f} MB)')
 

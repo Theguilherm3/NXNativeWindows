@@ -15,6 +15,19 @@ Check whether the SDK carries the renderer: list the `sdk` module's exports for 
 The open then goes through `CreateAudioRendererManagerByDfc`; no IPC.
 For a replaced DSP renderer the size query keeps the service's work-buffer contract; a larger local CPU representation is a backend cost. See [A sound engine's heap too small for its renderer and players](#a-sound-engines-heap-too-small-for-its-renderer-and-players).
 
+### SDK 1: the renderer is the `audren:u` service
+
+- **Symptom:** the host stops at boot with `[RED] sf: the game connects to service audren:u itself, which the host does not serve`, under `nn::audio::GetAudioRendererWorkBufferSize` or `OpenAudioRenderer`.
+- **Cause:** SDK 1.3.1 carries only the renderer's client: no `nn::audio::server::`, no `ExecuteAudioRendererRendering`, no DFC manager. Its `nn::audio` connects to `audren:u` (`CreateAudioRendererManagerByHipc`, `sdk+0x1641dc`), as on Horizon, so [the CPU renderer above](#running-the-sdks-own-renderer-on-the-cpu) has nothing to run.
+- **Fix:** the host serves `audren:u` (`hle_audren_sv.c`, registered with `SF_SERVICE` in [`hle_sf.c`'s host sessions](services.md#game-linked-hipc-clients-of-system-services)), and `hle_audren.c`'s work size, open and close hooks hand an SDK without `ExecuteAudioRendererRendering` straight to the SDK's own client. Every layout was read off SDK 1.3.1's client:
+  - the manager: 0 `OpenAudioRenderer` (the 0x34-byte parameter, its revision at +0x30; the work buffer's transfer memory and the process as copied handles; the work size and applet resource user ID at +0x38 / +0x40; the process ID; the renderer comes back as a moved session), 1 `GetWorkBufferSize` (the service budget, `dm_audren_work_size`), 2 `GetAudioDeviceService` (zeroed answers; the device calls are taken over above the service).
+  - the renderer: 0–3 sample rate, sample count, mix buffer count, state (0 started); 4 `RequestUpdate` (A: the update; B: the answer; B: performance frames); 5 / 6 start and stop; 7 `QuerySystemEvent` (a copied read end of the renderer's kernel event); 8 / 9 the rendering time limit.
+  - the update, revision REV2: a 0x40-byte header with each section's size (behaviour +4, memory pools +8, voices +0xc, channel resources +0x10, effects +0x14, mixes +0x18, sinks +0x1c, performance +0x20, splitters +0x24, total +0x3c), then behaviour (0x10), memory pools (0x20), channel resources (0x70: ID, 24 volumes, in use at +0x64), voices (0x170: the client's `VoiceInfo` from +0x40), effects (0xc0), splitters, mixes (0x930: volume, buffer count +8, in use +0xc, ID +0x10 with the final mix 0, 24 × 24 volumes from +0x24, destination +0x924), sinks (0x140: type +0, in use +1, the device's from +0x20 with its input count at +0x120 and six inputs at +0x124), performance (0x10). The answer: memory pools (0x10: a requested attach, 4, answers attached, 5; a requested detach, 2, answers detached, 3), voices (0x10: samples played, wave buffers consumed), effects (0x10: 3 enabled, 4 disabled), sinks (0x20), performance (0x10), behaviour (0xb0). The client aborts unless the answer's total equals its buffer, and fails the update when a section's size differs from what it reads back.
+  - the renderer: voices (PCM8, PCM16 and DSP ADPCM; four wave buffers in a ring, consumed at their end unless they loop, the played count restarting at an end of stream; a stop consumes what is queued) resampled linearly, through their channel resources' volumes into their mix; sub mixes deepest first; Aux effects (type 2) through the game's send and return rings, whose DSP offsets are at +0x40 / +0x44 of each info; buffer mixers; the final mix through the first device sink to stereo (5.1 down-mixed). Delay, reverb and biquad effects pass the dry signal and splitters are not followed, each with a red line. A guest thread renders one frame per output block and signals the renderer's event while it is started.
+  - `svcCreateTransferMemory` answers a handle outside the kernel handle table: the placeholder answer left the work buffer's address in w1, and the client's later close of that "handle" could have closed another object.
+  - `t_audren_sv` drives the service through `hle_sf.c` as SDK 1.3.1's client does.
+- **Found on:** [Rayman Legends: Definitive Edition](../../dm/games/01005FF002E2A000/README.md) (SDK 1.3.1). The renderer in [PR #1540](https://github.com/seedds/nxnative/pull/1540) (from the patch in issue #960) read the client's own structures at SDK 1.3.1's offsets instead, and took effect type 3 (delay) for Aux.
+
 ### SDK 8's longer `AudioRendererParameter`
 
 - **Symptom:** abort with Result 0x499 in `audio::GetAudioRendererWorkBufferSize`.
@@ -29,9 +42,23 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** both forms go through one open that starts the thread (`hle_audren.c` `ar_open`).
 - **Found on:** [Balatro](../../dm/games/0100CD801CE5E000/README.md) (SDK 18.3.2, LÖVE's OpenAL Soft; one boot).
 
+### A game with more than one renderer
+
+- **Symptom:** `[RED] audren: a second renderer (the host drives only one)` with different parameters from the first open; later, `catch-up renders so far` in the thousands (7,625 in 6 minutes), about 10% of the first renderer's frames.
+- **Cause:** a game may open several renderers, as on Horizon. The host kept one set of globals: the second renderer got no render thread, but `AudioRenderSystem::Update` is one hook for all of them, so each update of the second renderer found nothing rendered since the last, rendered a catch-up frame of the second renderer and queued it in the first one's output, in place of a frame of its own.
+- **Fix:** `hle_audren.c` keeps each renderer's state in `ar_t`: its render thread, output, catch-up queue, counters and upsampler history. Two renderers play through two outputs, which the sound card mixes. An SDK call that names only the `AudioRenderSystem` finds its renderer by `ar_of_sys`. One lock still serializes all rendering, since the header layout is decided once, from the first list, by trying each layout in turn; a frame takes about 0.02 ms. Catch-up renders went from 7,625 to 0 or 1 in a run. `dm/host/tests/t_audren_layout.c` checks the lookup and the upsampler's separate history.
+- **Found on:** [Mario & Luigi: Brothership](../../dm/games/01006D0017F7A000/README.md) (SDK 12.3.2): one renderer at 48 kHz, which sounds during the movie, and Unreal's mixer at 32 kHz.
+
+### Two renderers overwriting each other's queued blocks
+
+- **Symptom:** with two renderers open, one plays single 5 ms frames between silences and its sound effects are missing, while the other has an occasional all-zero 5 ms block; no underrun and no `[RED]` line, and the AudioOut `appended` and `released` counts stay balanced. Cross-correlating the outputs finds one renderer's waveform on the other.
+- **Cause:** AudioOut queues a block's pointer and copies its samples when the sound card asks (`h_au_Append`, `pull` in `hle_audio.c`). `render_main` kept its four blocks in function-level statics, left out when the renderer state moved into `ar_t`, so every render thread filled the same four. A block queued for one output could be rewritten by the other renderer's thread before it played. A second renderer's start also set the size of the blocks to 0 under the first one's output, whose `b->size - a->pos` could then underflow on a part-played block.
+- **Fix:** the blocks are in `ar_t`, one set per renderer. The slots are static and `CloseAudioRenderer` joins the render thread before a slot is reused, so a block outlives its output. `t_audren_layout` queues every block of one renderer, renders the other, and checks the first one's samples.
+- **Found on:** title `01007ED02424E000` (not in the [games table](../../dm/games/README.md#games); [issue #1336](https://github.com/seedds/nxnative/issues/1336), on an iPad Pro M1). [Mario & Luigi: Brothership](../../dm/games/01006D0017F7A000/README.md) also opens two renderers; it has not been run with the fix.
+
 ### The SDK's open with an event calls the open without one (`t_in_open`)
 
-- **Symptom:** `[RED] audren: a second renderer` right after the first open, with the same work buffer and "original device 1 mode 1".
+- **Symptom:** `audren: OpenAudioRenderer` logged twice right after the first open, with the same work buffer and "original device 1 mode 1", and a second render thread (until 2026-11-04 the second log line was `[RED] audren: a second renderer`, which now means [more than one renderer](#a-game-with-more-than-one-renderer)).
 - **Cause:** not a second renderer: SDK 17.5.3's `OpenAudioRenderer` with an event opens it by calling the form without one through the PLT (`sdk+0x1e489c`), which the loader binds to the host's hook since that form has one ([A renderer opened without an event](#a-renderer-opened-without-an-event)), so `ar_open` ran twice for one renderer. The inner call started the render thread before the outer one had created the event, and the outer call took the renderer for a second one.
 - **Fix:** a thread-local flag (`t_in_open`) hands the inner call straight to the SDK with the host's CPU / manual copy of the parameter, and only the outer call starts the thread (`hle_audren.c`).
 - **Found on:** [ROMANCE OF THE THREE KINGDOMS 8 REMAKE](../../dm/games/0100C2A01A730000/README.md) (SDK 17.5.3).
@@ -40,14 +67,21 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 
 - **Symptom:** the frame loop stops for good as a level loads while audio keeps rendering. The main thread waits in `os::WaitSystemEvent` under `CAudioMemoryPool::Shutdown`, and a sound thread of higher priority waits on the same condition variable.
 - **Cause:** with the DSP service (device 0, what the game asks for) `OpenAudioRenderer` attaches the service's renderer event, a kernel readable event (`AttachReadableHandleToSystemEvent`, auto-clear). With CPU rendering and manual execution, which the host switches to ([Running the SDK's own renderer on the CPU](#running-the-sdks-own-renderer-on-the-cpu)), it creates a local one instead (`CreateSystemEvent(event, AutoClear, false)`, SDK 4: `sdk+0x190b6c`). Signalling a local auto-clear event wakes one waiter, the one of highest priority. A kernel event wakes every waiter, and each one tries `ResetSignal`. Donkey Kong Country: Tropical Freeze waits on the event from two threads: its sound thread (priority 29, `main+0x971e8`) every frame, and the main thread while it detaches an audio memory pool (`main+0x6fa8c`: `RequestDetachMemoryPool`, then wait and update until `IsMemoryPoolAttached` is false). The sound thread took every wake, and the main thread never woke again.
-- **Fix:** when the game opened the renderer for the service, the host replaces the SDK's local event with an inter-process auto-clear one (`DestroySystemEvent`, then `hle_bind_system_event(event, 1)` in `ar_open`). The SDK's renderer signals through `os::SignalSystemEvent`, which handles either kind. A game that opens a CPU renderer itself keeps the SDK's local event.
+- **Fix:** when the game opened the renderer for the service, the host replaces the SDK's local event with an inter-process auto-clear one (`DestroySystemEvent`, then `hle_bind_system_event(event, 1)` in `ar_open`), and the game's event waits on a copy of its read end. That event is the renderer's own, not the game's ([The renderer event belongs to the renderer, not the game](#the-renderer-event-belongs-to-the-renderer-not-the-game)). The SDK's renderer signals through `os::SignalSystemEvent`, which handles either kind. A game that opens a CPU renderer itself keeps the SDK's local event.
 - **Found on:** [Donkey Kong Country: Tropical Freeze](../../dm/games/0100C1F0051B6000/README.md) (SDK 4.4.0): the first level's load after the intro cinematic.
+
+### The renderer event belongs to the renderer, not the game
+
+- **Symptom:** the game exits with 42 on its first rendered audio frame: `Break#1 reason=0` in `os::SignalSystemEvent`, called from the public `ExecuteAudioRendererRendering` on the host's render thread (`render_main`).
+- **Cause:** with the DSP service (what the game asks for), no SDK's `OpenAudioRenderer` keeps a pointer to the game's `SystemEventType`. It stores NULL in the handle's event slot and attaches the service's readable handle to the object, so the game may destroy the object or reuse its memory once the open returns. The slot is `handle[1]` in SDKs 3, 5 and 12 (SDK 3 `sdk+0x17e004`, SDK 12 `sdk+0x4d2b4`) and `*handle[1]` in SDK 18. The CPU / manual open the host switches to ([Running the SDK's own renderer on the CPU](#running-the-sdks-own-renderer-on-the-cpu)) stores the object in that slot instead (SDK 3 `sdk+0x17dffc`, SDK 12 `sdk+0x4d274`), and `ExecuteAudioRendererRendering` signals it after every render. LEGO Star Wars: The Skywalker Saga passes an event on its stack, and Little Nightmares reuses the object's memory. The first render found a state byte (+0x28) that was no longer the event's, and the SDK aborted.
+- **Fix:** `ar_open` gives the SDK's open an event of the renderer's own (`g_rev` in `hle_audren.c`, alive until `CloseAudioRenderer`, which destroys it), whatever slot the SDK keeps it in. The game's object gets a copy of that kernel event's read end (`hle_dup_readable_handle`), attached as managed and auto-clear, as the service's copied handle is. The renderer never touches the game's object again. The host's binding no longer sits at the game's address either, where a later service event at the same storage would have found it (`hle_bind_system_event` returns early for an address it already holds). Tests: `t_audren_work` (the game's event is overwritten after the open, including the SDK 3 to 12 slot) and `t_system_event` (the copied read end).
+- **Found on:** LEGO Star Wars: The Skywalker Saga (`010042D00D900000`, 1.10.0, SDK 12.3.6; issue #632), Little Nightmares (`01002FC00412C000`, 1.0.4, SDK 3.5.1; PR #804), both from provisional profiles. DRAGON BALL FighterZ (`0100A250097F0000`, SDK 4.5.0; issue #771) aborts at the same place, and SDK 5.4's open and `ExecuteAudioRendererRendering` are the same code as SDK 3's and 12's. None of the three is here: the fix awaits their reporters' runs.
 
 ### The renderer's update lock (`update_lock`)
 
 - **Symptom:** none of its own; command generation races the game's `Update` on SDKs whose lock is not at SDK 16's offset.
-- **Cause:** `AudioRenderSystem::Update` holds a mutex in `AudioRenderSystem`; `GenerateCommand` does not take it, so the host does (the auto-mode system thread does the same in `SendCommandToDsp`). Which mutex depends on the SDK: `nn::os::LockMutex(MutexType *)` at +0x1d0 in SDK 4.4 and at +0x1d8 in 6.4–8.2, `SdkMutexType::Lock` at +0x1d8 in 10.4–11.4, +0x1f0 in 13.3–16.2 and +0x1f8 in 17.5 (the `sdk` builds of 24 games on hand), inlined in 19 and 20 (+0x2d0, the Span layout: [SDK 20's `AudioRenderSystem` layout](#sdk-20s-audiorendersystem-layout)). The host took SDK 16's for every SDK before 20, which wrote a lock word into another field and excluded nothing.
-- **Fix:** `update_lock` in `hle_audren.c` reads it off the SDK's own `Update`: the register the prologue adds the offset to and moves into x0 before its first `bl`, whose PLT slot must hold `LockMutex` or `SdkMutexType::Lock`; anything else keeps SDK 16's.
+- **Cause:** `AudioRenderSystem::Update` holds a mutex in `AudioRenderSystem`; `GenerateCommand` does not take it, so the host does (the auto-mode system thread does the same in `SendCommandToDsp`). Which mutex depends on the SDK: `nn::os::LockMutex(MutexType *)` at +0x1d0 in SDK 4.4 and at +0x1d8 in 6.4–8.2, `SdkMutexType::Lock` at +0x1d8 in 10.4–11.4, +0x1f0 in 13.3–16.2, +0x1f8 in 17.5 and +0x208 in 18.3 (the `sdk` builds of the games on hand). From SDK 19 `Update` reads the system tick and calls `UpdateImpl`, which takes it ([The update lock read off `UpdateImpl`](#the-update-lock-read-off-updateimpl)). The host took SDK 16's for every SDK before 20, which wrote a lock word into another field and excluded nothing.
+- **Fix:** `update_lock` in `hle_audren.c` reads it off the SDK's own `Update`: the register the prologue adds the offset to and moves into x0 before its first `bl`, whose PLT slot must hold `LockMutex` or `SdkMutexType::Lock`. A miss in `Update` goes on to `UpdateImpl`; a miss in both keeps the layout's offset and logs a red line. Test: `t_audren_layout`.
 - **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (4.4), the first game it was plainly wrong for.
 - **Check:** checked with sound on [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (11.4, +0x1d8), [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) (7.3, `MutexType` +0x1d8) and [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (7.3, which is silent for its first minute with either lock).
 
@@ -57,6 +91,14 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Cause:** the render path looked up `SdkMutexType::Lock` / `Unlock` before reading which lock the SDK's `Update` takes ([The renderer's update lock](#the-renderers-update-lock-update_lock)); SDK 3.5.1's `sdk` has no `SdkMutexType` and takes `nn::os::LockMutex` at +0x1f8.
 - **Fix:** `render_once` looks up the `SdkMutexType` functions only when `update_lock` does not find `LockMutex` (`hle_audren.c`).
 - **Found on:** [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md) (SDK 3.5.1), the first SDK 3 game through the audio renderer (Bayonetta 2's 3.6.0 plays through `AudioOut`).
+
+### Where the `AudioRenderSystem` sits in `AudioRendererImpl`
+
+- **Symptom:** the sound is choppy: about two of every three 5 ms blocks are silent (a `DM_AUDIO_DUMP`), with no underruns. The log's `catch-up renders so far` grows by one for each rendered frame (2000 of every 2000), and every update logs `no frame rendered before update N`.
+- **Cause:** the host's takeover of `AudioRendererImpl::ExecuteAudioRendererRendering` found the `AudioRenderSystem` at a fixed `+0x60`, where SDK 16 and 20 keep it. SDK 3.4 keeps it at `+0x50` (`add x19, x0, #0x50` in the prologue, `sdk+0x188a10`). With the wrong pointer, the execution mode and rendering device came from other fields, so each render on the 5 ms render thread failed with 0x40299 and played a silent block. Only the game's updates rendered: one catch-up frame each, at 60 Hz instead of 200.
+- **Fix:** `impl_sys_off` in `hle_audren.c` reads the offset from the SDK's own function: the first `add xd, x0, #imm` before the first branch. If it finds none, it keeps `+0x60`. Every other `sdk` build on hand (18 games, SDK 4.5 to 21) reads `+0x60`.
+- **Found on:** [SteamWorld Dig](../../dm/games/01009320084A4000/README.md) and [SteamWorld Dig 2](../../dm/games/0100CA9002322000/README.md) (both ship the same SDK 3.4.0 `sdk` build).
+- **Check:** after the fix, the log has `audren: AudioRenderSystem at +0x50 in AudioRendererImpl`, a few dozen catch-up renders per 2000 frames, and a dump with no silent blocks once the music starts.
 
 ### The render thread's route through the public `ExecuteAudioRendererRendering` (SDK 20)
 
@@ -91,6 +133,14 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** select the header only when the whole list walks in a supported layout. Until then, return a silent frame before the sink scan; the first valid list can select both the header and its sink. `t_audren_layout` reproduces the failure and checks stereo PCM for SDK 4, 6, 16 and 21, with valid-first, empty and incomplete startup lists and SDK 21's short first list.
 - **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (SDK 4.4.0; [PR #331](https://github.com/seedds/nxnative/pull/331)).
 
+### Malformed later command lists and bounded histogram logging
+
+- **Symptom:** ASan reports a stack-buffer-overflow in `capture` while logging the first full command histogram; a malformed list can also consume sink discovery or return PCM before its invalid tail is checked.
+- **Cause:** a short valid list selected the header layout without running the histogram. A later malformed list entered the histogram scan, which stopped at its first invalid command but still logged an uninitialized string or adopted a sink from the valid prefix. Separately, accumulating `snprintf`'s untruncated return value advanced the next write past the 512-byte string.
+- **Fix:** validate the entire command list on every capture before histogram, sink discovery or PCM output. Keep discovery pending for rejected lists, initialize the histogram string, and stop appending at the last complete entry that fits.
+- **Check:** `t_audren_layout` covers malformed first, middle and trailing commands after layout selection, recovery to valid stereo PCM for SDK 4/5/6/16/21, and 64,000 synthetic commands whose histogram exceeds the log buffer. ASan reproduced both the uninitialized-string read and the truncated-append write before the fix.
+- **Found on:** synthetic command lists from the [issue #313 static-analysis audit](https://github.com/seedds/nxnative/issues/313#issuecomment-6543080671); no gameplay failure was attributed to these logging defects.
+
 ### The final mix is taken from the DeviceSink's mix buffers
 
 - **Symptom:** the CPU processor drops the final mix.
@@ -112,6 +162,13 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** `capture` in `hle_audren.c` takes the layout whose walk finds the 0xcafebabe magic on every command of the first valid list; [incomplete startup lists](#incomplete-startup-lists-must-not-select-the-command-layout) leave detection open.
 - **Found on:** [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md) (SDK 6.5.0).
 
+### SDK 5: a startup list that walks in two layouts, and a 0x138-byte DeviceSink
+
+- **Symptom:** no sound: `[RED] audren: no DeviceSink (ID 0x13) in the command list, 0 commands of 0x148 bytes` and `[RED] audren: command 2 in the command list is malformed (offset 0x3e, …)`, with `first-frame commands 13, by command ID:  0×2`.
+- **Cause:** SDK 5.4.0's command list has SDK 6's header. Its first list holds two commands, the first of ID 0x14 and 0x14 bytes, so it walks in the SDK 8–20 layout as well (the ID read as the size), and that layout was taken because it is tried first. Its DeviceSink (`CommandBuffer::GenerateDeviceSinkCommand`, `sdk+0x233890`) is SDK 4's (ID 0xf, device name +0x14, upsample buffer +0x118, input count +0x120) but 0x138 bytes, with the input indices as s16 from +0x124.
+- **Fix:** `capture` in `hle_audren.c` takes a header layout only from a list that walks in exactly one; a list that walks in none or in several is a silent frame. The sink scan takes the one 0x130-byte (s8 indices) or 0x138-byte (s16 indices, `g_sink5`) command with 1 to 6 inputs. `t_audren_layout` covers SDK 5 and Bastion's first list.
+- **Found on:** [Bastion](../../dm/games/010038600B27E000/README.md) (1.0.0, SDK 5.4.0).
+
 ### Unaligned command headers during layout probing
 
 - **Symptom:** UBSan reports a misaligned `uint32_t` load in `cmd_ok` while `t_audren_layout` probes SDK 4/6 lists (issue #409).
@@ -132,7 +189,14 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Cause:** in SDK 20 the getters the host used (`GetExecutionMode`, `GetRenderingDevice`, `GetCommandBufferWorkBufferSize`) are inlined away, `GenerateCommand` takes and returns a `Span<std::byte>` (the generated list comes back in x0 / x1), the device and mode are words at +0x48 / +0x4c, the command buffer is at +0xf8 / +0x100, and `UpdateImpl` locks the mutex at +0x2d0 instead of +0x1f0. The DeviceSink command became ID 0x14 (SDK 20 inserted a command before it) with the same layout.
 - **Fix:** `render_once` picks the layout by whether the Span version of `GenerateCommand` exists (`hle_audren.c`).
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md).
-- **Note:** the render thread's call takes another route in this SDK too: see [The render thread's route through the public `ExecuteAudioRendererRendering` (SDK 20)](#the-render-threads-route-through-the-public-executeaudiorendererrendering-sdk-20); the update lock at +0x2d0 is in [The renderer's update lock (`update_lock`)](#the-renderers-update-lock-update_lock).
+- **Note:** the render thread's call takes another route in this SDK too: see [The render thread's route through the public `ExecuteAudioRendererRendering` (SDK 20)](#the-render-threads-route-through-the-public-executeaudiorendererrendering-sdk-20); the update lock at +0x2d0 is in [The renderer's update lock (`update_lock`)](#the-renderers-update-lock-update_lock), and SDK 22 moved it ([The update lock read off `UpdateImpl`](#the-update-lock-read-off-updateimpl)).
+
+### The update lock read off `UpdateImpl`
+
+- **Symptom:** `CRASH sig=11 addr=0x20` at `nn::audio::server::AddressInfo::GetReference` (`sdk+0x249874`) on the render thread, under `CommandGenerator::GenerateDataSourceCommand` and `render_once`, minutes into a movie. The `AddressInfo` the crash register points at is all zeros, though the function had just read a non-null memory pool pointer from it. Or `[RED] audren: no update lock read off AudioRenderSystem::Update or UpdateImpl`, on an SDK whose code the scan does not recognize.
+- **Cause:** the Span layout took the lock at a fixed +0x2d0, which holds for SDK 19.3 to 21.4. SDK 22 moved it: `UpdateImpl` in 22.2.8 (`sdk+0x238530`) and 22.2.5 locks the `SdkMutexType` at +0x2d8 (`add x19, x0, #0x2d8; …; mov x0, x19; bl SdkMutexType::Lock`), as `SendCommandToDsp`, `Start`, `Stop` and `FinalizeImpl` do. Locked at +0x2d0, the render excluded nothing, and the game's `RequestUpdate` rewrote a voice while its commands were being generated. From SDK 19 `Update` reads the system tick first and calls `UpdateImpl`, so a scan of `Update` finds no lock.
+- **Fix:** `update_lock` (`hle_audren.c`) reads `Update`, then `UpdateImpl`, whatever the layout, and a miss in both is a red line. The start-up line names what it took: `update lock SdkMutexType at +0x2d8`. Test: `t_audren_layout`.
+- **Found on:** The Legend of Zelda: Ocarina of Time (Switch 2, `0400486024DEC000`, update v131072; its profile is in pull request #1299): the second run through its opening movie crashed, and the run with the offset read off `UpdateImpl` played the opening through to Kokiri Forest with sound. Checked statically on the `sdk` builds on hand: SDK 19.3 to 21.4 read +0x2d0, as before. SDK 22.2.0 (Fortune's Weave, EA SPORTS FC 27) is not on hand.
 
 ### SDK 21 DSP command header without a magic
 
@@ -142,6 +206,30 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Found on:** [Rhythm Heaven Groove](../../dm/games/0100D9F01D474000/README.md) (SDK 21.4.0, one boot).
 
 ## AudioOut and devices
+
+### An AudioOut opened at a rate other than 48 kHz
+
+- **Symptom:** the game quits before its first frame with `FATAL AudioOut sample rate 44100 not supported (48 kHz only)`, `CRASH sig=6` in `abort` under `au_open_at` / `h_au_OpenDef`, exit 134. Nothing is drawn.
+- **Cause:** audout takes only 0 (the default) or 48000 in `AudioOutParameter.sampleRate` and refuses any other rate with `ResultInvalidSampleRate`, 0x699 (module 153, description 3; yuzu's `audio_out_system.cpp` and Ryujinx's `AudioOutputSystem.cs` agree). A game written for that asks for its own rate first and opens again with the defaults when refused, then reads the output's rate back. The host stopped the game instead of refusing the open.
+- **Fix:** `au_open_at` refuses another rate as audout does: a `[RED]` line with the rate and the call site, and 0x699, before anything is allocated. The game then runs the path it runs on a console. Accepting the rate and converting it instead would run a path no console runs.
+- **Found on:** [Mega Man Legacy Collection](../../dm/games/01002D4007AE0000/README.md) (SDK 3.7.0): `main+0x9a3c8` opens at 44.1 kHz, `main+0x9a3cc` tests the result and opens again with a zeroed parameter, then reads the output's properties for its buffer sizes; it plays at 48 kHz with 0 underruns. Reported in [PR #2723](https://github.com/seedds/nxnative/pull/2723), which accepted the rate.
+- **Check:** `t_audio`'s `test_rate_refused`.
+
+### Periodic diagnostics outside the AudioUnit callback
+
+- **Symptom:** RealtimeSanitizer reports stdio locking in `au_render` at its 2,000-callback diagnostic boundary. A busy log writer can block that callback even when its PCM queue is full.
+- **Cause:** `LOG` takes `stderr`'s stream lock and formats its message on the calling thread. The callback previously called it directly for its frame-count, queue-depth and underrun statistics.
+- **Fix:** the callback publishes a bounded snapshot for the existing audio watchdog, which copies ready reports under the output-registry lock and writes them after unlocking. Its local copies own every log argument; a slow writer holds neither an output pointer nor the registry lock. The single-slot mailbox uses release/acquire ownership; a busy writer leaves the callback accumulating later windows instead of waiting or overwriting unread data. Reports retain the output ID, total callbacks, frame range, average queue depth and underrun/zero-padding counts, with the actual window length when several windows merge. The release-event notifier remains independent of diagnostics, so an event-driven game can keep refilling PCM while logging is blocked. Close stops the producer and takes any remaining snapshot under the same registry lock before freeing the output.
+- **Found on:** the [synthetic real-time audio audit in issue #313](https://github.com/seedds/nxnative/issues/313#issuecomment-6523656102). No particular game's audible failure is attributed to this finding.
+- **Check:** `t_audio_stats` calls the real callback with synthetic PCM and traps callback-thread stdio, including its stream lock. With the watchdog's writer deliberately blocked, each PCM buffer still triggers its guest release event and is refilled correctly; queued and merged reports preserve their fields. Close drains a second pending snapshot while the watchdog holds only a local copy, which it logs after the output was freed. Statistics alone cause no guest event. The fixture needs no sound device or game files.
+
+### AudioOut release notification can sleep with pending work
+
+- **Symptom:** PCM is consumed correctly and its buffer reaches the released queue, but the guest release event never arrives. The notifier is asleep with `notify_pending=1` and `notify_armed=0`.
+- **Cause:** the notifier cleared `notify_armed` with a release-only store before checking `notify_pending`. A producer could publish pending work and see the old armed value, leaving the notifier to wake itself; without acquiring that producer's exchange, the notifier could read stale pending state and sleep. Apple-silicon code generated a store-release followed by acquire-PC loads, which permit this ordering.
+- **Fix:** disarm with an acquire-release exchange. If the producer's armed exchange precedes it, the notifier acquires the pending publication. Otherwise the producer sees zero and posts, or finds the notifier already re-armed with its own semaphore post. No timeout, polling, callback logging or audio pacing changes are needed.
+- **Found on:** shared CI's `t_audio_stats` ASan/UBSan fixture, reproduced locally without a sound device or game. This is a general AudioOut mechanism; no gameplay reproduction is claimed.
+- **Check:** the existing blocked-diagnostics cases remain intact. The fixture also renders and individually reclaims 100,000 event-driven PCM buffers, so releases cannot be hidden by bulk notification coalescing. The old notifier naturally strands a release in this case; diagnostics distinguish event delivery, PCM contents and returned-buffer identity without retrying the failed wait.
 
 ### Stopping an AudioOut releases its pending buffers
 
@@ -156,7 +244,7 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Symptom:** crackling on iOS only.
 - **Cause:** RemoteIO asks for as many frames per callback as the audio session's I/O buffer duration, about 21 ms by default (1024 frames at 48 kHz), while the renderer keeps 4 blocks × 5 ms = 20 ms in flight. Every callback came up 1.3 ms short and was padded with zeros, about 47 gaps per second. Reproduced on the Mac by forcing 1024-frame callbacks (`DM_DBG_AU_FRAMES=1024` with `DM_AUDIO=1`: 1999 underruns in 2000 callbacks).
 - **Fix:** `AVAudioSession` `setPreferredIOBufferDuration:0.005` (and 48 kHz) before the game opens audio and again on return to the foreground (`front_ios_audio_session` in `front_ios.m`); the device then calls back with 240 frames and nothing underruns.
-- **Check:** when checking a new device, read the host's `audio #N device callbacks` line, logged every 2000 callbacks: frames per callback, queued blocks, underruns.
+- **Check:** when checking a new device, read the host's `audio #N device callbacks` line, normally reported every 2000 callbacks: frames per callback, queued blocks, underruns. A busy diagnostic writer can merge windows; the line states their actual callback count.
 
 ### The Mac's default I/O buffer
 
@@ -185,6 +273,15 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
   - a watchdog in `hle_audio.c` switches any started output whose device has not called back for 200 ms in focus to the silent sink, retrying the AudioUnit after 1, 2, 4, 8 s. A start that fails (session still held by a call) falls back the same way instead of aborting.
 - **Check:** the log shows `audio session: interrupted`, `the device has not called back for N ms` and `AudioUnit restarted`. `tests/t_audio.c` (in `dm/host`) scenario 3 stops a playing AudioUnit behind the host's back.
 
+### A blocked audio device start freezes the game
+
+- **Symptom:** a game stops advancing while the Mac's selected output refuses to play. A process sample shows `AudioOutputUnitStart` waiting in the HAL, with the game's audio renderer waiting for a released PCM buffer.
+- **Cause:** Start and the watchdog's retries stopped the silent sink and waited for the device while holding the output registry lock. A driver could block there for seconds or return success without delivering any callbacks.
+- **Fix:** the silent sink paces the guest at 48 kHz while a host worker starts the device. Until the watchdog sees a callback after startup and joins the silent sink, the device returns silence. A device that fails to deliver its first callback within one second is stopped and retried with backoff. Each output can start independently. A Close during a start that the driver still holds returns at once: it unregisters the output, and the start's worker stops and disposes the unit and frees the output when the driver returns (waiting for it in Close held the game's thread as long as the driver blocked).
+- **Check:** `tests/t_audio_device.c` (in `dm/host`) blocks the mock driver's `AudioOutputUnitStart`: Start returns and the queued buffer is released, callbacks play silence until the handoff, and Stop / suspend / reset / Close each run while the start is still blocked.
+- **Open:** `AudioOutputUnitStop` still runs under `g_aos_lock` (Stop, suspend, the media services reset, the watchdog's stall path). A driver that blocked there as it does in Start would hold the lock; not seen so far.
+- **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md), with an unavailable HDMI audio output on the Mac ([issue #1030](https://github.com/seedds/nxnative/issues/1030)).
+
 ### AudioUnit construction before output publication
 
 - **Symptom:** TSan reports `au_create` writing `a->au` while `au_watchdog` reads it under `g_aos_lock` when a second real output opens (issue #410).
@@ -201,7 +298,7 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 
 - **Symptom:** combined numbers mislead: one fully fed output plus one fed by nobody look like "every other callback underruns, 2.0 blocks queued".
 - **Cause:** a game may open several outputs. Engage opens one AudioOut from Wwise (`main+0x177d924`, no release event, the game polls); on the phone it opened a second one later, and the Mac runs never did. Unity's FMOD also has an output (`main+0x4aec0c` / `0x4aec4c`).
-- **Fix:** the host logs each output as `audio #N`: the open with its call site, Start / Stop / Close (the first 32 per output), and the callback line every 2000 of that output's callbacks.
+- **Fix:** the host logs each output as `audio #N`: the open with its call site, Start / Stop / Close (the first 32 per output), and the callback statistics normally every 2000 of that output's callbacks, through the [watchdog](#periodic-diagnostics-outside-the-audiounit-callback).
 - **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md).
 
 ### Checking audio without listening
@@ -229,12 +326,61 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Found on:** [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (SDK 19.3.1, Unreal Engine 4.27: `GetAudioDeviceOutputVolume`); [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md) (SDK 11: `GetAudioOutName`).
 - **Note:** older SDKs name some device calls differently (`ListAudioDeviceName` / `GetActiveAudioDeviceName`, `OpenDefaultAudioOut` in SDK 12; [Older SDK names for the same calls](services.md#older-sdk-names-for-the-same-calls)), and [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (SDK 7) aborted in `audio::AcquireAudioDeviceSwitchNotification` ([SDK calls that open a system service through sm](services.md#sdk-calls-that-open-a-system-service-through-sm)).
 
+### The output device notification under its SDK 21 and 22 name
+
+- **Symptom:** an `nn::diag` abort with Result 0xe15 on an audio thread at start, in `audio::CreateUserClientSessionByHipc` under `audio::AcquireAudioOutputDeviceNotification`, after the line `sf: the game connects to service aud:u itself`.
+- **Cause:** SDK 21 and 22 name the output device notification `AcquireAudioOutputDeviceNotification` (older SDKs: `AcquireAudioDeviceNotificationForOutput`, and SDK 7's `AcquireAudioDeviceSwitchNotification`). SDK 22.2.0's version (`sdk+0x1f1e00`) opens a user session with `aud:u`, which the host does not serve, asks it for a read end and attaches it AutoClear. It keeps no per-process flag (the service keys each acquire by its event) and returns a Result.
+- **Fix:** `hle_audren.c` takes the name over, first for SDK 21 (Splatoon Raiders); the same takeover serves SDK 22. The event is bound and never signaled, and the Result is 0. The takeover keeps the older names' once-per-process flag, so a second acquire returns 0x499 where SDK 22.2.0's code would bind again. No game has been seen to acquire twice.
+- **The release:** `ReleaseAudioOutputDeviceNotification` (`sdk+0x1f2ac0` in Nintendo Switch Sports Resort's sdk) asks `aud:u` through the device session coordinator, then destroys the event. The game destroys the event itself only if it is still initialized afterwards (`main+0x3af11a0`). `hle_audren.c` takes it over: it destroys the event it bound (which drops the binding) and clears the flag, so a later acquire binds again. With nothing acquired it does nothing. `t_audren_work` covers acquire, the refused second acquire, release and acquire again.
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) (Switch 2, SDK 22.2.0, `main+0xe7b9c`); [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md) (`04008E001F098000`: the release, `main+0x3af119c`).
+
 ### No audio input devices
 
-- **Symptom:** SDL3's audio driver lists the input devices (AudioIn) when its audio starts.
-- **Cause:** the host has no microphone.
-- **Fix:** `ListAudioIns` reports none, both opens fail, and the calls that need an open AudioIn answer without touching the game's object (`hle_audio.c`).
-- **Found on:** [Absolum](../../dm/games/0100A83022A22000/README.md) (SDK 18.3.2, FNA on .NET NativeAOT with SDL3; one boot each).
+- **Symptom:** SDL3's audio driver lists the input devices (AudioIn) when its audio starts. `[RED] sf: the game connects to service audren:u itself`, then `nn::diag abort: Result 0xe15` under `audio::AcquireAudioDeviceNotificationForInput` (`sdk+0x5633c`).
+- **Cause:** the host has no microphone. The input device-change notification goes through the audio device service, like the output one the host answers.
+- **Fix:** `ListAudioIns` reports none, both opens fail, and the calls that need an open AudioIn answer without touching the game's object (`hle_audio.c`). `AcquireAudioDeviceNotificationForInput` binds an event that is never signaled and returns 0x499 when acquired again, as the SDK does with a flag of its own (SDK 13.3.0 `sdk+0x56300`: `+0x851`, the output's `+0x852`; `hle_audren.c`).
+- **Found on:** [Absolum](../../dm/games/0100A83022A22000/README.md) (SDK 18.3.2, FNA on .NET NativeAOT with SDL3; one boot each); [Portal 2](../../dm/games/0100ABD01785C000/README.md) (SDK 13.3.0: its audio thread at start, `main+0x19f37c`).
+
+### No virtual audio input devices (SDK 22)
+
+- **Symptom:** `[RED] sf: the game connects to service auddmg:u itself, which the host does not serve`, then `game called nn::diag abort: Result 0xa99` at `sdk+0x1f61ac` under `audio::ListVirtualInputDevices`.
+- **Cause:** the game lists the virtual input devices when its audio starts (`main+0xf48124`) and opens the first with `audio::OpenInputStream` if there is one. The list goes through a service the host does not serve.
+- **Fix:** `ListVirtualInputDevices` reports none (`hle_audio.c` `h_is_List`), and the game skips its input stream.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (SDK 22.2.8); Star Fox imports the same calls.
+
+### `OpenAudioOut` without a release event (SDK 22)
+
+- **Symptom:** `game called nn::diag abort: Result 0xe15, call site sdk+0x1f8704`, i.e. inside `nn::audio::CreateAudioOutManagerByHipc+0xb4`, before any audio device opened.
+- **Cause:** SDK 22 calls **`nn::audio::OpenAudioOut(AudioOut*, const char*, const AudioOutParameter&)`** (`sdk+0x1f7914`, `nn::audio::OpenAudioOut(AudioOut*, const char*, const AudioOutParameter&)`'s failure path) — the overload without the `SystemEvent` the host implemented (`_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPKcRKNS0_17AudioOutParameterEPNS_2os11SystemEventE`). With no hook the SDK's own IPC path ran and the audout service is not there.
+- **Fix:** `hle_audio.c` gained the 4-argument hook, which opens through the same `au_open_at` and leaves the release event NULL (`au_open_at(g, NULL, name, param, __builtin_return_address(0))`), so the output polls its released buffers. The log then reads `OpenAudioOut … , no release event (the game polls)`.
+- **Found on:** [Well Dweller](../../dm/games/0100217023F6C000/README.md) (SDK 22.2.0); the game's first `AudioOut` is the "DeviceOut" form, the second its 48 kHz music output.
+
+### SDK 21's OutputStream on a virtual output device
+
+- **Symptom:** `[RED] sf: the game connects to service auddmg:u itself, which the host does not serve`, then `game called nn::diag abort: Result 0xa99` under `nn::audio::GetDefaultVirtualOutputDevice` (`sdk+0x221520`, `audio::detail::GetVirtualOutputDeviceProperties`).
+- **Cause:** SDK 21 has a second output interface beside AudioOut: `GetDefaultVirtualOutputDevice` names a virtual device, `OpenOutputStream` opens a stream on it with a `StreamFormat` {sample format, channels, sample rate} (5, float), a capacity in frames and, in one overload, a system event; the game writes a period at a time with `WriteOutputStream` once `GetOutputStreamFreeFrameCount` covers it, waiting on the event with a short timeout between writes. States as games read them: 0 not open (the SDK's own answer for a null stream), 1 stopped, 2 started: a game's close path stops a stream in state 2 and purges and closes one in state 1, so a wrong answer leaves it open for good. `GetOutputStreamStatistics` returns a 24-byte struct through x8. Every call reaches the service.
+- **Fix:** `hle_audio.c` opens one AudioOut per stream, its release event the stream's: each write becomes a 16-bit interleaved block (float clamped and scaled), the free count is the capacity less the frames still queued, `Purge` drops the queued blocks, `SetOutputStreamGain` is the AudioOut's volume (no fade), `StartOutputStreams` starts several, and the statistics report nothing. Input streams answer as AudioIn does: no device, and an open fails. The default virtual device is `AudioVirtualOutput`, a name of the host's.
+- **The frames are interleaved:** `WriteOutputStream` takes L, R, L, R, although the game's code that zeroes an unfilled tail (`main+0xad1684`) steps by a period per channel. Read as planar, each 10 ms block's first half played as left and its second half as right, each at half speed: all sound an octave low (voices very deep) with a jump at every block (crackling). In `DM_AUDIO_DUMP` that shows as a spectrum mirrored about 12 kHz (33-39 % of the energy above 20 kHz where 0.00 % belongs) and channels whose samples alternate between two signals (lag-1 autocorrelation 0.18, lag-2 0.99). `t_output_stream` checks the order.
+- **A larger statistics result ends the game:** Star Fox keeps its 24 bytes at `sp` with its stack canary right behind them (`main+0xbce9b90`), so a 32-byte result ended in `__stack_chk_fail` on the audio thread (`CRASH sig=4`, `lr=main+0xbce9f98`).
+- **Focus:** Star Fox closes its stream when its window loses focus and opens a new one when it regains it; 14 rounds went by with the sound intact.
+- **Found on:** Xenoblade Chronicles 2, Nintendo Switch 2 Edition (`0400E95004038001`) (SDK 21.4.4, one or two 2-channel streams at 48 kHz, 10 ms periods, 40 ms capacity; the second when the active device is `AudioExternalOutput`); [Star Fox](../../dm/games/0400E88025B1A000/README.md) (Wwise 2024.1, SDK 21.4.4).
+
+### The virtual output device's properties, and the OutputStream open without flags
+
+- **Symptom:** `[RED] sf: the game connects to service auddmg:u itself, which the host does not serve`, then `game called nn::diag abort: Result 0xa99, call site sdk+0x224d1c` (`audio::detail::GetVirtualOutputDeviceProperties`), right after `GetDefaultVirtualOutputDevice`.
+- **Cause:** before each OutputStream open the game asks for the default virtual output device's properties with `nn::audio::GetVirtualOutputDeviceProperties` (`main+0x5eda90`, `main+0x7a0414`); the SDK's version asks the device manager service for the device's 0x228-byte profile. It then opens the stream with the `OpenOutputStream` overload that takes no flags (`main+0x5edb34`), which the host did not take over either.
+- **The properties:** `VirtualDeviceProperties` is 0x110 bytes, filled from the profile at `sdk+0x224cd4`: the name asked about (+0x00, 0x100 bytes); the profile's +0x218 at +0x100, the device's shortest stream as a duration in ns (`OutputStreamImpl::Open` refuses a capacity under ceil(duration x rate / 1e9) frames with 0x899, `sdk+0x225a94`; the input stream open the same); and the profile's +0x108 at +0x108, a 32-bit word nothing in the sdk reads. Both of the game's callers, and Donkey Kong Bananza's two (`main+0x57cadc`, `main+0x187cee4`), only test the Result.
+- **Fix:** `hle_audio.c` answers for its one device, `AudioVirtualOutput`: the name, a shortest stream of 10 ms (one period as Xenoblade Chronicles 2 and Star Fox write it; the host's own open sets no minimum) and 0 in the unidentified word. Any other name gets a red line and a failure. The overload without flags opens like the others. `t_output_stream` covers both.
+- **Open:** what the +0x108 word means; no caller seen reads it.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md) (`04008E001F098000`; SDK 20+).
+
+### The AudioOutBuffer handed to the SDK is its own 40-byte object
+
+- **Symptom:** a game that resamples its own audio plays, in one block of every four, the sound of four blocks earlier: Metro 2033 Redux (44.1 kHz to 48 kHz in the game's own resampler) re-appended 518 of its 2,095 loud 8192-byte blocks (24.7 %) still holding the contents of the block 4 appends back, so that audio left 170.6 ms behind; after the fix 0 of 1,989, with no block appended twice or lost and no underruns.
+- **Cause:** the host declared `nn::audio::AudioOutBuffer` as 24 bytes, data at +0x00, capacity at +0x08, data size at +0x10. The SDK's object is 40 bytes, `{next, buffer, buffer_size, data_size, data_offset}`, the audout service's own buffer format: data at +0x08, capacity at +0x10, data size at +0x18 (`SetAudioOutBufferInfo`, `sdk+0x80f80`; the same in Hades's SDK, `sdk+0x142ab0`). The SDK's `AudioBufferList` links buffers through `next` at +0x00, where the old layout wrote the data pointer. The host does not take `GetAudioOutBufferBufferSize` over, so the SDK's own (`sdk+0x80fb0`) read the host's data-size field as the capacity and answered with the previous block's: 2047 frames of the 2048 the resampler had room for. On every fourth block the resampler then wrote nothing, and the game appended that block at full length holding the earlier contents.
+- **Fix:** the host's buffer description is the SDK's object: one definition, `aout_buf` in `dm/host/hle.h`, five fields at the SDK's offsets with a `_Static_assert` on them, which `hle_audio.c`'s AudioOut and the blocks `hle_audren.c` appends to it both use. The descriptor functions (`SetAudioOutBufferInfo` in both overloads, `GetAudioOutBufferDataPointer`, `GetAudioOutBufferBufferSize`, `GetAudioOutBufferDataSize`) run in the sdk, as AudioIn's do, so no accessor can read a layout of the host's; they are the same plain stores and loads in the SDKs of Metro 2033 Redux (SDK 8.2.0), Hades, Fire Emblem: Three Houses (which also has the overload without a buffer size, storing only +0x08 and +0x18) and PRAGMATA (Switch 2). `GetAudioOutBufferBufferSize` answers 8192 on every block.
+- **Found on:** [Metro 2033 Redux](../../dm/games/0100D4900E82C000/README.md) (SDK 8.2.0, 4A Engine).
+- **Check:** `t_audio`'s buffer-layout case hands the device callback an object written at the SDK's own offsets, its `next` linked and its data size 4 bytes short of its capacity: the callback must play exactly the data size from the data pointer, release the buffer and leave `next` alone. Under the 24-byte layout it would read `next` as the data.
 
 ## Codecs
 
@@ -243,11 +389,32 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Symptom:** an abort in `sm::Initialize` under the hardware Opus decoder's C interface; for the multi-stream one, under `nn::codec::GetHardwareOpusMultiStreamDecoderWorkBufferSize(int, int, int, int, int)` (at `nnMain`, CRI's Opus streams). An abort in `sf::hipc::InitializeHipcServiceResolution` under `codec::GetHardwareOpusDecoderWorkBufferSize(int, int)` (`main+0x31f8e8`, early in `nnMain`). A game that builds `HardwareOpusMultiStreamDecoder` with the imported constructor and then calls it through its vtable.
 - **Cause:** the hardware decoders are a service. The `HardwareOpusMultiStreamDecoder` class's 12 vtable slots match the SDK's software `OpusMultiStreamDecoder` one by one. SDK 11 has a work buffer size form without the option argument; the host had only the three-argument one.
 - **Fix** (`hle_codec.c`):
-  - the classes: the constructor hook builds the software decoder in place (0x38 of the 0x48 bytes), as for the single-stream `HardwareOpusDecoder`; `GetHardwareOpusMultiStreamDecoderWorkBufferSize` returns the software size. Both destructors are a bare `ret`.
+  - the classes: the constructor binds to the software class's, which builds the software decoder in place (0x38 of the 0x48 bytes), as for the single-stream `HardwareOpusDecoder`, and so do the members ([A hardware Opus class's members called directly](#a-hardware-opus-classs-members-called-directly)); `GetHardwareOpusMultiStreamDecoderWorkBufferSize` returns the software size. Both destructors are a bare `ret`.
   - the single-stream C interface (`GetHardwareOpusDecoderWorkBufferSize`, `InitializeHardwareOpusDecoder`, `DecodeOpusInterleavedWithHardware`, …) is forwarded to the `sdk`'s software `OpusDecoder` C interface with a host-held decoder state per game object.
   - the multi-stream C interface, including the SDK 12+ overload with an option argument, goes to the `sdk`'s software `OpusMultiStreamDecoder` C interface, with a host-held state per game object as for the single-stream decoder. `GetHardwareOpusMultiStreamDecoderProcessingTime` reports 0.
   - the two-argument `GetHardwareOpusDecoderWorkBufferSize` is hooked beside the three-argument one.
 - **Found on:** [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md) (SDK 9.6: only the `HardwareOpusMultiStreamDecoder` class and the four-argument size); [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) (1.4.3, the single-stream C interface); [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (SDK 11.4.3, the two-argument size); [Unicorn Overlord](../../dm/games/010069401ADB8000/README.md) (SDK 16.2.4, the multi-stream C interface; one boot).
+
+### A hardware Opus class's members called directly
+
+- **Symptom:** an abort under `hwopus` (or a second, uninitialized decoder) in movie or audio setup, from a game that calls `nn::codec::HardwareOpusDecoder`'s members itself (`Initialize`, `GetWorkBufferSize`, `Finalize`, `DecodeInterleaved`, the destructors), not through `IOpusDecoder`'s vtable.
+- **Cause:** the host took over only the constructor, which builds the SDK's software `OpusDecoder` in the object. Calls through the vtable then reach the software members, but a game that holds the decoder by value or by its own class calls the hardware members directly (the compiler devirtualizes them), and they ran on the software object. In Super Mario Party's `sdk`, `Initialize`, `DecodeInterleaved` and `GetWorkBufferSize` go to the hardware C interface (which the host serves with a second decoder state beside the object), and `Finalize`, `IsInitialized`, `GetSampleRate`, `GetChannelCount` and `Reset` read the hardware layout (`Finalize` calls through `+0x08`, `sdk+0x22ff10`). The multi-stream class is the same.
+- **Fix:** each hardware member, both classes, binds to the software class's member of the same signature: a guest alias (`HLE_FORCE_ALIAS`, `hle.h`), an entry in the forced take-over table that binds every reference to the loaded modules' definition of another name, with no host code and no restated signature. The constructor is one too (the option in `w1` has no software counterpart); `C2` and `D2` bind to `C1` and `D1`, the same code without virtual bases. Each SDK defines the same member set for both classes of a pair (Super Mario Party's has `Reset` and no `Decode` or `SetContext`, ŌKAMI HD's the reverse); a target no module defines is logged as a red line and the reference keeps its binding. `t_symbols` checks the alias binding.
+- **Found on:** Just Dance 2022 (`0100EA6014BB8000`, SDK 11.4.0; [PR #2746](https://github.com/seedds/nxnative/pull/2746), not in the games table) and [Rayman Legends: Definitive Edition](../../dm/games/01005FF002E2A000/README.md) (SDK 1.3.1; [PR #1540](https://github.com/seedds/nxnative/pull/1540)). The bindings were checked against Super Mario Party's and ŌKAMI HD's `sdk` symbols.
+
+### SDK 21's hardware Opus decoder manager
+
+- **Symptom:** `game called nn::diag abort: Result 0xe15` under `nn::codec::GetHardwareOpusDecoderManagerWorkBufferSize` (`sdk+0x323180`), the game's sound setup.
+- **Cause:** SDK 21's asynchronous interface to the hardware decoder: a manager (`HardwareOpusDecoderManagerType`, with a system event, a decoder count and an I/O buffer count) owns decoders (`InitializeHardwareOpusDecoder` with a manager). The game enqueues one packet per call (`EnqueueOpusDataToHardwareOpusDecoder`, Nintendo's 8-byte header and the packet, as `DecodeOpusInterleaved` takes it; it expects all of it consumed), calls `ExecuteHardwareOpusDecoderDecoding` once per audio frame, dequeues finished frames (`DequeuePcmInterleavedDataFromHardwareOpusDecoder`) as many as the completed count, and reads the waiting / executing / completed counts and the free I/O buffers. It tells an initialized manager by the struct's first word.
+- **Fix:** `hle_codec.c` keeps the manager in host state (its pointer in that first word) and decodes with the `sdk`'s software `OpusDecoder`: Enqueue queues the packet and takes an I/O buffer, Execute decodes every waiting packet on the caller's thread and signals the event, Dequeue hands back a frame and its buffer. So a request is never "executing". A packet the decoder refuses completes as 20 ms of silence, with a red line. `ResetHardwareOpusDecoder` and `FinalizeHardwareOpusDecoder` serve both interfaces.
+- **Found on:** Xenoblade Chronicles 2, Nintendo Switch 2 Edition (`0400E95004038001`) (SDK 21.4.4: a mono manager of 128 decoders and 255 I/O buffers, a stereo one of 72 and 160, 48 kHz, 20 ms frames); [Star Fox](../../dm/games/0400E88025B1A000/README.md) (the same figures).
+
+### One key for the two forms of the Opus decoder
+
+- **Symptom:** `CRASH sig=11 addr=0` in `h_codec_HwOpusFini`, the first time the game finalizes a decoder.
+- **Cause:** the older interface keeps the software state in `objmap` under the game's decoder object, and SDK 21's manager form its own record under the same key. `opus_mgr_dec_fini` told them apart by a field at +0x10, 0 in the software state as far as Star Fox had shown, but the work buffer's size in this one. It read the state as a record, so a pointer in it became the manager.
+- **Fix:** a manager's decoder is kept under the object + 1 (`OPUS_MGR_KEY`), so the look-up itself says which form it is; `GetHardwareOpusDecoderSampleRate` and `ChannelCount` now also read a manager's decoder correctly.
+- **Found on:** [Kirby Air Riders](../../dm/games/040077201BE50000/README.md) (SDK 20.5.26, 48 kHz stereo, the older form).
 
 ## Timing and catch-up
 

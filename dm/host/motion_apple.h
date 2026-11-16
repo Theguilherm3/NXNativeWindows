@@ -9,6 +9,7 @@
 
 static inline void dm_motion_attach(GCController *c, int player) {
     const char *e = getenv("DM_MOTION"); if (e && !atoi(e)) return;
+    dm_motion_clear(player);   // another controller takes the player: its stream and learned gyro offset start again (hle_hid.c)
     GCMotion *mo = c.motion;
     if (!mo || !mo.hasRotationRate) return;
     if (mo.sensorsRequireManualActivation) mo.sensorsActive = YES;   // DualSense / DualShock 4: off until asked for
@@ -26,6 +27,12 @@ static inline void dm_motion_attach(GCController *c, int player) {
         }
         dm_motion_set(player, acc, rot);
     };
+}
+// iOS turns a manual-activation controller's sensors off while the app is in the background (Control Center, the home screen) and leaves them off, so the gyro stayed dead until the
+// controller reconnected (found by MacNativeGames on the iPad). Called when the app becomes active again: only controllers attached above (their handler is set)
+static inline void dm_motion_rearm(GCController *c) {
+    GCMotion *mo = c.motion;
+    if (mo && mo.valueChangedHandler && mo.sensorsRequireManualActivation) mo.sensorsActive = YES;
 }
 static inline void dm_motion_detach(GCController *c, int player) {
     GCMotion *mo = c.motion;

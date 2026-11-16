@@ -15,3 +15,7 @@ win/build/
 __pycache__/
 win/sdk/extract.log
 win/gui_settings.json
+# coverage.py data and its JSON report (pyproject.toml, [tool.coverage.run])
+.coverage
+.coverage.*
+/coverage.json

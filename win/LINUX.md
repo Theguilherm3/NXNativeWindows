@@ -81,6 +81,8 @@ WINEPREFIX=~/.local/share/wineprefixes/metal wine "$TOOLS/metal-tools/bin/metal.
 
 During a build, `metal.exe` prints lines like `Rename failed: ... invalid argument` under Wine. You can ignore them: the compiler falls back to another way of writing the file, and its output lands anyway.
 
+The build runs Wine without a graphics driver (`win/toolchain.py` sets `WINEDLLOVERRIDES=winex11.drv=d;winewayland.drv=d` unless you set it yourself). With one, every wineserver start runs `explorer.exe`, which maps an X window and drops it when the server exits. Over dozens of `metal.exe` runs under load, GNOME Shell (mutter 46) crashed on such a window, logging `BadWindow (invalid Window parameter)` with `request_code 25`, and took the desktop session down. The compiler needs no window and runs at the same speed without the driver. If you run `metal.exe` by hand during a build, pass the same variable. Wine then logs `nodrv_CreateWindow` and `Could not create tray window`, which you can ignore.
+
 ### 6. The iPhoneOS SDK
 
 From the repository folder:

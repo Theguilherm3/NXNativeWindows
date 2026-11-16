@@ -46,12 +46,14 @@ class Shim(unittest.TestCase):
 
 class HostSources(unittest.TestCase):
     def test_matches_makefile(self):
-        files, incs = build_app.host_sources(Path('gen/x'))
+        files, incs = build_app.host_sources(Path('gen/x'), Path('gen/msl-iphoneos'))
         names = {f.name for f in files}
         self.assertIn('main.c', names); self.assertIn('entry.S', names); self.assertNotIn('front_mac.m', names)
+        self.assertIn('save_sync.c', names); self.assertIn('web_apple.m', names); self.assertIn('pad_switch2_apple.m', names)
         self.assertTrue(any(f.parent.name == 'nvn' for f in files)); self.assertTrue(any('libvpx' in str(f) for f in files))
+        self.assertTrue(any('dav1d' in str(f) and f.suffix == '.S' for f in files)); self.assertFalse(any(f.name.endswith(('_tmpl.c', '_tmpl.S')) or f.name == 'util.S' for f in files))
         self.assertTrue(all(f.exists() for f in files))
-        self.assertEqual(incs[0], (REPO / 'dm/gfx/nvn/include').resolve())
+        self.assertEqual(incs[:2], [(REPO / 'dm/gfx/nvn/include').resolve(), Path('gen/msl-iphoneos').resolve()])
 
 
 class Plist(unittest.TestCase):
@@ -179,6 +181,7 @@ class BcSoft(unittest.TestCase):
 
 
 class PackIpa(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', '--exec sets the mode on Windows only; elsewhere the file keeps its own')
     def test_exec_bit_on_windows(self):
         with tempfile.TemporaryDirectory() as d:
             app = Path(d) / 'DmIOS.app'; app.mkdir(); (app / 'DmIOS').write_bytes(b'\xcf\xfa\xed\xfe'); (app / 'Info.plist').write_bytes(b'x')
