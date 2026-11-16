@@ -43,6 +43,13 @@ def weak_imports(data):
     return out
 
 
+def windows_xlate_file(p):
+    """NXNativeWindows keeps the translator's framework-dependent .NET build beside the native one: Windows has no Mach-O, so win/toolchain.py runs dmsh_xlate.dll
+    with dotnet. Its dlls, pdb and json files, and the satellite folders (holding only *.resources.dll), are that build; anything else stays an error"""
+    if p.is_dir(): return all(f.is_file() and f.name.endswith('.resources.dll') for f in p.iterdir())
+    return p.suffix in ('.dll', '.pdb', '.json')
+
+
 def nsp_script():
     spec = importlib.util.spec_from_file_location('build_ipa_from_nsp_native', REPO / 'scripts/build_ipa_from_nsp.py')
     assert spec and spec.loader
@@ -65,7 +72,13 @@ class NativeTools(unittest.TestCase):
 
     def test_only_the_executable_is_committed(self):   # no dlls, runtimeconfig or satellite folders of a framework-dependent build left beside it
         for exe in (XLATE, NX):
-            with self.subTest(exe=exe.name): self.assertEqual(sorted(p.name for p in exe.parent.iterdir() if not p.name.startswith('.')), [exe.name])
+            with self.subTest(exe=exe.name):
+                extra = sorted(p.name for p in exe.parent.iterdir() if not p.name.startswith('.') and not (exe is XLATE and windows_xlate_file(p)))
+                self.assertEqual(extra, [exe.name])
+
+    def test_windows_translator_is_whole(self):   # NXNativeWindows: win/toolchain.py runs `dotnet dmsh_xlate.dll`, which needs its deps and runtimeconfig beside it
+        for name in ('dmsh_xlate.dll', 'dmsh_xlate.deps.json', 'dmsh_xlate.runtimeconfig.json'):
+            with self.subTest(name=name): self.assertTrue((XLATE.parent / name).is_file(), f'{name} is missing beside {XLATE.name}')
 
     def test_projects_publish_native(self):
         for proj in ('dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj', 'dm/tools/nx_extract/nx_extract.csproj'):

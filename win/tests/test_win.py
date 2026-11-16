@@ -181,6 +181,7 @@ class BcSoft(unittest.TestCase):
 
 
 class PackIpa(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', '--exec sets the mode on Windows only; elsewhere the file keeps its own')
     def test_exec_bit_on_windows(self):
         with tempfile.TemporaryDirectory() as d:
             app = Path(d) / 'DmIOS.app'; app.mkdir(); (app / 'DmIOS').write_bytes(b'\xcf\xfa\xed\xfe'); (app / 'Info.plist').write_bytes(b'x')
